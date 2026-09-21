@@ -275,10 +275,7 @@ def set_layer(path, key, *, output=None, **fields) -> bool:
     meta["generator"] = M.GENERATOR
     if rewrite_meta_in_place(path, meta):
         return True
-
-    def patch(m: dict) -> None:
-        m.clear()
-        m.update(meta)
-
-    remux(path, None, meta_patch=patch)
+    # No room beside the current metadata: rewrite the file. The edits are applied to the metadata
+    # remux() builds (its still-resource offsets are recomputed for the rewritten resource region).
+    remux(path, None, meta_patch=lambda m: M.apply_edits(m, key, fields))
     return False

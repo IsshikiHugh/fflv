@@ -509,7 +509,11 @@ The v1 binary structures (file header, composite frames, index) are unchanged. T
 
 **B.4 `layers[].content_size: [w, h]`**. 4:2:0 needs even dimensions; layers with an odd width or height are padded to even size by repeating their last row/column. This field records the region of valid pixels (default: the coded size). Players and decoders crop the padding before scaling to `rect`, so changing `rect` later does not distort the image. The padding must repeat real pixels: `fflv pack` pads in 4:4:4 RGB, because FFmpeg's `pad` rounds the size of an odd, chroma-subsampled frame down to even and fills the dropped row/column with black.
 
-**B.5 Reserved metadata space**. Writers fill the space after the metadata JSON with spaces up to `resources_offset` (by default they reserve max(4 KiB, 2 × metadata size), rounded up to 4 KiB). `meta_length` counts only the JSON itself. This lets renaming and changes to z / rect / blend / opacity / visible rewrite the metadata in place — instantly, whatever the file size (`fflv set`).
+**B.5 Reserved metadata space and copy-on-write edits.** Writers reserve room for the metadata between the end of the header and `resources_offset` (by default max(4 KiB, 2 × metadata size), rounded up to 4 KiB) and fill the unused part with spaces. `meta_length` counts only the JSON itself; `meta_offset` may point anywhere inside this region. An in-place edit (`fflv set`: renaming, z / rect / blend / opacity / visible) is copy-on-write, so a crash at any moment leaves a valid file:
+1. the new JSON is written to free space in the region — at its start if it fits before the current copy, otherwise right-aligned at its end — never over the current copy, and synced to disk;
+2. then the 64-byte header is rewritten to point at it (`meta_offset`, `meta_length`) and synced.
+
+The edit is instant whatever the file size. It works whenever the old and the new copy fit in the region together; otherwise the file is rewritten (B.7) with a fresh reservation.
 
 **B.6 `generator`** (optional): name of the writing tool, e.g. `"fflv"`.
 

@@ -156,3 +156,75 @@ def test_packed_file_can_be_edited(packed, tmp_path):
     with fflv.open(path) as r:
         assert "calib" not in [L.id for L in r.layers] and r.layer("note").kind == "still"
         assert r.meta["audio"] is not None
+
+
+def test_in_place_edits_are_crash_safe_and_alternate(base, monkeypatch):
+    """Copy-on-write metadata: a crash before or during the switch leaves the old metadata; edits
+    keep fitting beside the current copy, so the file never has to be rewritten (spec B.5)."""
+    import fflv.format.container as C
+
+    def name_of(path):
+        with fflv.open(path) as r:
+            return r.layer("b").name
+
+    with LVFReader(base) as r:
+        capacity = r.header.resources_offset - 64
+        grow = capacity // 2 - r.header.meta_length - 64
+
+    def crash(*_a):
+        raise RuntimeError("power cut")
+
+    def half_written(f, offset, data):
+        f.seek(offset)
+        f.write(data[: len(data) // 2])
+        raise RuntimeError("power cut")
+
+    for step in ("_switch_header", "_write_meta_copy"):
+        with monkeypatch.context() as m:
+            m.setattr(C, step, crash if step == "_switch_header" else half_written)
+            with pytest.raises(RuntimeError, match="power cut"):
+                fflv.set_layer(base, "b", name="x" * grow)
+        assert validate(str(base)).ok and name_of(base) == "b", f"crash in {step} broke the file"
+
+    size = base.stat().st_size
+    for n in (grow, 3, grow, 10, grow // 2, grow):
+        assert fflv.set_layer(base, "b", name="y" * n) is True
+        assert validate(str(base)).ok and name_of(base) == "y" * n
+    assert base.stat().st_size == size
+
+
+def test_set_fallback_keeps_stills_stored_out_of_layer_order(tmp_path):
+    """A (third-party) file whose resource region stores stills in another order than the layers:
+    the rewrite fallback of set_layer must keep every still with its own image."""
+    import json
+
+    from fflv.format import LVFWriter
+
+    src = tmp_path / "canon.lvd"
+    # two colors whose PNGs have the same length (a swap would then go unnoticed by validation)
+    red, blue = np.full((8, 8, 3), (30, 20, 10), np.uint8), np.full((8, 8, 3), (10, 20, 30), np.uint8)
+    with fflv.Writer(src, (16, 8)) as w:
+        w.add_layer("v", rect=(0, 0, 2, 2))
+        w.add_still("red", red, rect=(0, 0, 8, 8))
+        w.add_still("blue", blue, rect=(8, 0, 8, 8))
+        w.write(v=np.zeros((2, 2, 3), np.uint8))
+    with LVFReader(src) as r:
+        meta = r.meta
+        res = {L["id"]: r.resource(L["resource"]["offset"], L["resource"]["length"])
+               for L in meta["layers"] if L["kind"] == "still"}
+        caus = [c for _o, c, _s in r.iter_caus()]
+    assert len(res["red"]) == len(res["blue"])
+    for L in meta["layers"]:  # store blue first, red second
+        if L["kind"] == "still":
+            L["resource"]["offset"] = 0 if L["id"] == "blue" else len(res["blue"])
+    odd = tmp_path / "odd.lvd"
+    w = LVFWriter(odd)
+    w.begin(json.dumps(meta).encode(), res["blue"] + res["red"], meta_capacity=0)  # no room: forces a rewrite
+    for c in caus:
+        w.write_cau(c)
+    w.finish()
+    assert validate(str(odd)).ok
+    assert fflv.set_layer(odd, "v", name="renamed") is False
+    with fflv.open(odd) as r:
+        img = r.frame(0, layers=["red", "blue"])
+    assert tuple(img[4, 4]) == (30, 20, 10) and tuple(img[4, 12]) == (10, 20, 30)

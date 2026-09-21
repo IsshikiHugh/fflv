@@ -31,28 +31,59 @@ def encode_meta(meta: dict) -> bytes:
 
 
 def meta_capacity_for(meta_bytes: bytes) -> int:
-    """Room reserved for the metadata: twice its size (at least 4 KiB), in 4 KiB steps. The
-    unused tail is filled with spaces (valid JSON whitespace) so small edits can be made in place."""
+    """Room reserved for the metadata: twice its size (at least 4 KiB), in 4 KiB steps, so that an
+    edited copy fits beside the current one (see rewrite_meta_in_place)."""
     need = max(4096, 2 * len(meta_bytes))
     return (need + 4095) // 4096 * 4096
 
 
+def _free_slot(region: tuple[int, int], current: tuple[int, int], size: int) -> int | None:
+    """Offset of `size` bytes inside `region` that do not overlap `current` (both [start, end))."""
+    lo, hi = region
+    cur_start, cur_end = current
+    if cur_start - lo >= size:  # at the start, before the current copy
+        return lo
+    end = (hi - size) // 8 * 8  # right-aligned at the end, so copies alternate between the two ends
+    if end >= max(cur_end, lo):
+        return end
+    return None
+
+
+def _sync(f: BinaryIO) -> None:
+    f.flush()
+    os.fsync(f.fileno())
+
+
+def _write_meta_copy(f: BinaryIO, offset: int, data: bytes) -> None:
+    f.seek(offset)
+    f.write(data)
+    _sync(f)
+
+
+def _switch_header(f: BinaryIO, header: FileHeader) -> None:
+    f.seek(0)
+    f.write(header.pack())
+    _sync(f)
+
+
 def rewrite_meta_in_place(path: str | os.PathLike, meta: dict | bytes) -> bool:
-    """Replace the metadata of an existing file without touching anything else.
-    Returns False (and changes nothing) when it does not fit in the reserved region."""
+    """Replace the metadata of an existing file without touching anything else (spec B.5).
+
+    Copy-on-write, so a crash at any point leaves a valid file: the new JSON is written to free
+    space in the reserved region [end of header, resources_offset) — never over the current copy —
+    and synced; only then is the 64-byte header switched to it (meta_offset, meta_length).
+    Returns False (and changes nothing) when there is no room beside the current copy."""
     data = meta if isinstance(meta, bytes) else encode_meta(meta)
     with open(path, "r+b") as f:
         header = FileHeader.unpack(f.read(HEADER_SIZE))
-        capacity = header.resources_offset - header.meta_offset
-        if len(data) > capacity:
+        region = (HEADER_SIZE, header.resources_offset)
+        current = (header.meta_offset, header.meta_offset + header.meta_length)
+        offset = _free_slot(region, current, len(data))
+        if offset is None:
             return False
-        f.seek(header.meta_offset)
-        f.write(data + b" " * (capacity - len(data)))
-        header.meta_length = len(data)
-        f.seek(0)
-        f.write(header.pack())
-        f.flush()
-        os.fsync(f.fileno())
+        _write_meta_copy(f, offset, data)
+        header.meta_offset, header.meta_length = offset, len(data)
+        _switch_header(f, header)
     return True
 
 
