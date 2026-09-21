@@ -526,7 +526,8 @@ The edit is instant whatever the file size. It works whenever the old and the ne
 - All layers must be declared before the first `write()`, because every composite frame has to list every video layer.
 - A layer becomes active at the first frame it is given an image. If a later frame gives it no image, it keeps showing the previous one (the same image is encoded again, at almost zero bitrate), until `end_layer()` or the end of the file.
 - Key frames are at each layer's first frame and on the global `gop` grid.
-- The file is written to `<path>.part`; on close the metadata (into the reserved space) and the index are written, then it is atomically renamed and validated.
+- The file is written to a hidden temporary file (B.11); on close the metadata (into the reserved space) and the index are written, the file is validated, and only then atomically renamed to its destination.
+- Images are checked before any state changes, so a rejected image leaves the writer as it was. If encoding fails inside `write()`, the layers' encoders may be out of step with the file, so the writer refuses to continue (`write()` / `close()` raise; `abort()` discards the file).
 
 **B.9 `fflv view`**. A local HTTP server (listening on 127.0.0.1 only) serves the player and the file, with Range and ETag support.
 - The player sends `If-Match` with every range read; when the file has been replaced, the server answers 412 and the player reloads instead.

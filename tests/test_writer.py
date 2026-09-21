@@ -118,7 +118,7 @@ def test_writer_errors(tmp_path):
         with fflv.Writer(tmp_path / "a.lvd", (64, 64)) as w:
             w.add_layer("a")
             w.write(b=np.zeros((64, 64, 3), np.uint8))
-    assert not (tmp_path / "a.lvd").exists() and not (tmp_path / "a.lvd.part").exists()
+    assert not (tmp_path / "a.lvd").exists() and not list(tmp_path.glob(".*fflv-tmp"))
 
     w = fflv.Writer(tmp_path / "b.lvd", (64, 64))
     w.add_layer("a")
@@ -135,7 +135,7 @@ def test_writer_errors(tmp_path):
             w.add_layer("a")
             w.add_layer("b")
             w.write(a=np.zeros((64, 64, 3), np.uint8))
-    assert not (tmp_path / "c.lvd").exists() and not (tmp_path / "c.lvd.part").exists()
+    assert not (tmp_path / "c.lvd").exists() and not list(tmp_path.glob(".*fflv-tmp"))
 
     with pytest.raises(WriterError, match="contiguous"):
         with fflv.Writer(tmp_path / "d.lvd", (64, 64)) as w:
@@ -157,3 +157,68 @@ def test_image_types_are_normalised(tmp_path):
         m = [rgba for _, rgba in r.layer_frames("m")]
     assert (g[0][:, :, :3] == 128).all() and (g[1][:, :, :3] == 7).all()
     assert (m[0] == 255).all() and (m[1] == 0).all()
+
+
+def test_a_failed_encode_makes_the_writer_refuse_to_continue(tmp_path, monkeypatch):
+    """After an encoder error mid-frame the other layers' encoders are a frame ahead of the file;
+    continuing would produce a file that validates but decodes wrongly."""
+    from fflv.encode.vp9enc import LayerEncoder
+
+    path = tmp_path / "broken.lvd"
+    w = fflv.Writer(path, (32, 32), gop=4)
+    w.add_layer("a", lossless=True)
+    w.add_layer("b", lossless=True)
+    for f in range(3):
+        w.write(a=np.full((32, 32, 3), f, np.uint8), b=np.full((32, 32, 3), f, np.uint8))
+    real = LayerEncoder.encode_prepared
+
+    def flaky(self, rgb, a, key):
+        if self.name == "b":
+            raise RuntimeError("encoder crashed")
+        return real(self, rgb, a, key)
+
+    monkeypatch.setattr(LayerEncoder, "encode_prepared", flaky)
+    with pytest.raises(RuntimeError, match="encoder crashed"):
+        w.write(a=np.full((32, 32, 3), 3, np.uint8), b=np.full((32, 32, 3), 3, np.uint8))
+    monkeypatch.undo()
+    with pytest.raises(WriterError, match="failed while encoding"):
+        w.write(a=np.full((32, 32, 3), 4, np.uint8), b=np.full((32, 32, 3), 4, np.uint8))
+    with pytest.raises(WriterError, match="not written"):
+        w.close()
+    assert not path.exists() and not list(tmp_path.glob(".*fflv-tmp"))
+
+
+def test_a_rejected_image_changes_nothing(tmp_path):
+    """A bad image for one layer must not update another layer's sticky image or start frame."""
+    path = tmp_path / "keep.lvd"
+    with fflv.Writer(path, (16, 16)) as w:
+        w.add_layer("a", lossless=True)
+        w.add_layer("b", lossless=True)
+        w.write(a=np.full((16, 16, 3), 10, np.uint8), b=np.zeros((16, 16, 3), np.uint8))
+        with pytest.raises(ValueError):
+            w.write(a=np.full((16, 16, 3), 99, np.uint8), b=np.zeros((8, 8, 3), np.uint8))
+        w.write(b=np.zeros((16, 16, 3), np.uint8))  # "a" omitted: repeats its last *written* image
+    with fflv.open(path) as r:
+        a = dict(r.layer_frames("a"))
+    assert sorted(a) == [0, 1] and (a[1][:, :, :3] == 10).all()
+
+
+def test_invalid_output_never_replaces_the_destination(tmp_path, monkeypatch):
+    import fflv.format.output as output
+    from fflv.format.validate import Report
+
+    path = tmp_path / "dst.lvd"
+    path.write_bytes(b"previous version")
+
+    def failing_validate(p):
+        rep = Report(p)
+        rep.add("I1", "simulated failure")
+        return rep
+
+    monkeypatch.setattr(output, "validate", failing_validate)
+    with pytest.raises(WriterError, match="failed validation"):
+        with fflv.Writer(path, (16, 16)) as w:
+            w.add_layer("a")
+            w.write(a=np.zeros((16, 16, 3), np.uint8))
+    assert path.read_bytes() == b"previous version"
+    assert not list(tmp_path.glob(".*fflv-tmp"))

@@ -111,7 +111,8 @@ fflv.render("debug.lvd", "clip.mp4", layers=["frame", "pred"], start=0, end=300)
 - All layers must be declared before the first `write()`.
 - A layer appears from the first frame it is given an image. If a later frame gives it no image, it keeps showing the previous one; `end_layer()` ends it early.
 - Layers are encoded in parallel and every frame is written to disk immediately, so memory use does not grow with the length of the video.
-- The file is first written as `.part`, renamed on close, and validated automatically.
+- The file is written to a hidden temporary file, validated on close, and only then renamed into place.
+- If encoding fails inside `write()`, the writer refuses to continue (`abort()` discards the file).
 
 **Quality and size:**
 - `crf` (default 32; lower means better quality and bigger files).

@@ -6,7 +6,6 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 # interrupted writes / edits
-*.part
 .*.fflv-tmp
 # player
 player/node_modules/

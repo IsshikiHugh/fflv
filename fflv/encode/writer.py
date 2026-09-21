@@ -14,7 +14,10 @@ Semantics
     its last image ("sticky"), until `end_layer()` or the end of the file.
   * Key frames sit on the global grid (every `gop` frames) plus each layer's first frame, so every
     multiple of `gop` is a random-access point.
-  * The file is written to "<path>.part" and renamed on `close()`; then it is validated.
+  * The file is written to a hidden temporary file beside `path`; `close()` validates it and then
+    atomically renames it to `path` (spec B.11).
+  * If encoding fails inside `write()`, the layers' encoders may be out of step with the file, so
+    the writer refuses to continue: further `write()` / `close()` calls raise; use `abort()`.
 """
 
 from __future__ import annotations
@@ -26,7 +29,8 @@ from fractions import Fraction
 from pathlib import Path
 
 from .. import meta as M
-from ..format import AudioPacket, Cau, LVFWriter, VideoEntry, encode_meta, meta_capacity_for, parse_fps, pts_us, validate
+from ..format import AudioPacket, Cau, LVFWriter, VideoEntry, encode_meta, meta_capacity_for, parse_fps, pts_us
+from ..format.output import InvalidOutput, publish, temp_path_for
 from ..format.constants import CAU_FLAG_RAP, ENTRY_EMPTY, ENTRY_FRAME, FRAME_FLAG_KEY
 from .audio import AudioTrack, encode_audio
 from .media import png_size, still_png
@@ -86,9 +90,10 @@ class Writer:
         self._audio: AudioTrack | None = None
         self._audio_pos = 0
         self._out: LVFWriter | None = None
-        self._part = self.path.with_name(self.path.name + ".part")
+        self._part = temp_path_for(self.path)
         self._frames = 0
         self._closed = False
+        self._broken: BaseException | None = None
         self._pool = ThreadPoolExecutor(max_workers=threads or min(16, (os.cpu_count() or 4)))
         self.report = None
 
@@ -180,10 +185,16 @@ class Writer:
         self._out = LVFWriter(self._part)
         self._out.begin(draft, resources, meta_capacity=meta_capacity_for(draft))
 
-    def write(self, images: dict | None = None, /, **kw) -> int:
-        """Append one composite frame. Pass images by layer id (keyword or dict). Returns the frame index."""
+    def _check_usable(self) -> None:
         if self._closed:
             raise WriterError("writer is closed")
+        if self._broken is not None:
+            raise WriterError(f"a previous write() failed while encoding ({self._broken!r}); the encoders are out of "
+                              f"step with the file, so it cannot be completed — call abort()")
+
+    def write(self, images: dict | None = None, /, **kw) -> int:
+        """Append one composite frame. Pass images by layer id (keyword or dict). Returns the frame index."""
+        self._check_usable()
         imgs = dict(images or {})
         imgs.update(kw)
         videos = [L for L in self._layers if isinstance(L, _Video)]
@@ -196,17 +207,29 @@ class Writer:
         if self._out is None:
             self._begin()
         f = self._frames
-        jobs = []
+        # Check and convert every image before changing any state: a bad image leaves the writer as it was.
+        prepared = {}
         for L in videos:
             if L.id in imgs:
                 if L.end is not None:
                     raise WriterError(f"layer {L.id!r} was ended at frame {L.end}; a layer is one contiguous range")
-                L.last = L.encoder.prepare(imgs[L.id])
+                prepared[L.id] = L.encoder.prepare(imgs[L.id])
+        jobs = []
+        for L in videos:
+            if L.id in prepared:
+                L.last = prepared[L.id]
                 if L.start is None:
                     L.start = f
             if L.start is not None and L.end is None:
                 key = f == L.start or f % self.gop == 0
                 jobs.append((L, key))
+        try:
+            return self._encode_and_write(f, jobs)
+        except BaseException as exc:
+            self._broken = exc
+            raise
+
+    def _encode_and_write(self, f: int, jobs: list) -> int:
         results = dict(zip((L.id for L, _ in jobs),
                            self._pool.map(lambda j: j[0].encoder.encode_prepared(*j[0].last, j[1]), jobs)))
         keys = {L.id: key for L, key in jobs}
@@ -246,6 +269,9 @@ class Writer:
     def close(self) -> None:
         if self._closed:
             return
+        if self._broken is not None:
+            self.abort()
+            raise WriterError(f"not written: a write() failed while encoding ({self._broken!r})")
         try:
             if self._out is None:
                 raise WriterError("no frames were written")
@@ -259,17 +285,16 @@ class Writer:
                     raise WriterError(f"still {L.id!r} range [{L.start}, {L.end}) is outside the {n} frames written")
             self._out.finish(meta=self._meta(n, final=True))
             self._out = None
-            os.replace(self._part, self.path)
+            self.report = publish(self._part, self.path, check=self.check)
+        except InvalidOutput as exc:
+            self.abort()
+            raise WriterError(str(exc)) from exc
         except BaseException:
             self.abort()
             raise
         finally:
             self._closed = True
             self._pool.shutdown(wait=True)
-        if self.check:
-            self.report = validate(str(self.path))
-            if not self.report.ok:
-                raise WriterError(f"{self.path} failed validation: " + "; ".join(str(i) for i in self.report.errors[:5]))
 
     def abort(self) -> None:
         """Discard everything written so far."""
