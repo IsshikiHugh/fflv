@@ -90,6 +90,10 @@ export class Player extends EventTarget {
   private origin: Origin | null = null;
   private reloading = false;
   private watchTimer = 0;
+  /** ETag of the version last opened or attempted; kept even when that load failed. */
+  private watchedEtag: string | null = null;
+  /** Position and UI settings to restore when a reload follows a failed load. */
+  private lastKeep: KeptState | null = null;
   reloads = 0;
   private lastRafMs = 0;
   private refreshMs = 1000 / 60;
@@ -130,6 +134,7 @@ export class Player extends EventTarget {
         return;
       }
       this.source = source;
+      if (bytes instanceof HttpByteSource) this.watchedEtag = bytes.etag;
       this.audio = audio;
       this.clock = audio ?? new PerformanceClock();
       this.notice = source.meta.audio && !audio ? 'audio track present but not decodable here; playing without audio' : null;
@@ -148,39 +153,59 @@ export class Player extends EventTarget {
     }
   }
 
-  /** Re-open the same file (e.g. after it was rewritten), keeping position and layer settings. */
+  /** Position, play state and the layer settings changed in the UI (by layer id). */
+  private captureState(): KeptState {
+    const overrides = new Map<string, Partial<LayerState>>();
+    (this.source?.meta.layers ?? []).forEach((L, i) => {
+      const s = this.layerStates[i];
+      const o: Partial<LayerState> = {};
+      if (s.visible !== L.visible) o.visible = s.visible;
+      if (s.opacity !== L.opacity) o.opacity = s.opacity;
+      if (Object.keys(o).length) overrides.set(L.id, o);
+    });
+    return { frame: this.targetFrame, playing: this.isPlaying, overrides };
+  }
+
+  /**
+   * Re-open the same file (e.g. after it was rewritten), keeping position and layer settings. After
+   * a failed load there is nothing on screen to capture, so the state from before it is restored.
+   */
   async reload(): Promise<void> {
     if (!this.origin || this.reloading) return;
     this.reloading = true;
     try {
-      const overrides = new Map<string, Partial<LayerState>>();
-      (this.source?.meta.layers ?? []).forEach((L, i) => {
-        const s = this.layerStates[i];
-        const o: Partial<LayerState> = {};
-        if (s.visible !== L.visible) o.visible = s.visible;
-        if (s.opacity !== L.opacity) o.opacity = s.opacity;
-        if (Object.keys(o).length) overrides.set(L.id, o);
-      });
-      const keep: KeptState = { frame: this.targetFrame, playing: this.isPlaying, overrides };
+      const keep = this.source ? this.captureState() : (this.lastKeep ?? undefined);
+      this.lastKeep = keep ?? null;
       const o = this.origin;
       await this.open(o.kind === 'url' ? o.url : o.blob, o.name, keep);
-      this.reloads++;
-      this.emit('reloaded');
+      if (this.source && this.mode !== 'error') {
+        this.reloads++;
+        this.emit('reloaded');
+      }
     } finally {
       this.reloading = false;
     }
   }
 
-  /** Poll the URL's ETag and reload when the file changes (files opened from a URL only). */
+  /**
+   * Poll the URL's ETag and reload when the file changes (files opened from a URL only). Polling
+   * goes on after a failed load — e.g. a file caught half-written — so the next version is picked up.
+   */
   watch(enable = true): void {
     window.clearInterval(this.watchTimer);
     if (!enable) return;
+    const busy = () => this.reloading || (this.mode as PlayerMode) === 'loading';
     this.watchTimer = window.setInterval(async () => {
       const o = this.origin;
-      const bytes = this.source?.bytes;
-      if (o?.kind !== 'url' || !(bytes instanceof HttpByteSource) || this.reloading || this.mode === 'loading') return;
+      if (o?.kind !== 'url' || busy()) return;
       const etag = await HttpByteSource.currentEtag(o.url);
-      if (etag && bytes.etag && etag !== bytes.etag && this.source?.bytes === bytes) void this.reload();
+      if (!etag || this.origin !== o || busy()) return; // state may have changed while we waited
+      if (this.watchedEtag === null) {
+        this.watchedEtag = etag; // the first load failed before it saw an ETag
+      } else if (etag !== this.watchedEtag) {
+        this.watchedEtag = etag;
+        void this.reload();
+      }
     }, WATCH_INTERVAL_MS);
   }
 

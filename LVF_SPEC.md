@@ -533,6 +533,7 @@ The edit is instant whatever the file size. It works whenever the old and the ne
 - The ETag is derived from the file's inode, size and modification time, so it changes when the file is replaced (B.11) or rewritten in place (B.5). Each request opens the file once and takes the ETag, the size and the bytes from that one open file, so a response never mixes the ETag of one version with the bytes of another.
 - The player sends `If-Match` with every range read; when the file has been replaced, the server answers 412 and the player reloads instead.
 - The player polls the ETag once a second and reloads automatically when the file changes. A reload keeps the current frame, the play state, and the layer settings the user changed in the UI; everything else takes the new file's defaults.
+- Polling continues after a failed load (for example a file caught half-written by a writer that does not follow B.11): the next version is loaded as soon as it appears, restoring the position and UI settings from before the failure.
 
 **B.10 Decoding in Python** (`fflv.open` / `fflv render` / `fflv extract`) decodes only the selected layers, starting at the nearest RAP at or before the target frame. YUV→RGB uses the BT.601/709/2020 formulas in numpy, because swscale's result depends on the frame width (when the width is not a multiple of 16, Y = 235 becomes 253) and on the CPU. Compositing uses the same formulas as the WebGL player: straight alpha; add is min(1, d + a·c); multiply / screen follow the W3C separable blend modes.
 

@@ -168,4 +168,23 @@ test.describe('following edits to the file', () => {
     expect(Object.keys(b.codes).sort()).toEqual(['exact', 'square', 'sync_a']);
     for (const n of Object.values(b.codes)) expect(n).toBe(123);
   });
+
+  test('keeps watching after a failed load and recovers when the file is complete again', async ({ page }) => {
+    await page.goto(`http://127.0.0.1:${port}/?src=/media/watched.lvd&watch=1`);
+    await settle(page);
+    await seek(page, 77);
+    await page.locator('#layers li[data-index="0"] input[type=checkbox]').click(); // hide bg in the UI
+
+    // A writer that rewrites the file in place (not atomically) is caught half-way ...
+    const good = fs.readFileSync(TEST_FILE);
+    fs.writeFileSync(file, good.subarray(0, good.length >> 1));
+    await page.waitForFunction(() => window.__lvf.player.mode === 'error', null, { timeout: 15_000 });
+    // ... and then finishes: the page must pick the file up again, where it was.
+    fs.writeFileSync(file, good);
+    await waitReload(page, 1);
+    const b = await barcodes(page, probe);
+    expect(b.frame).toBe(77);
+    expect(Object.keys(b.codes)).not.toContain('bg'); // UI setting from before the failure kept
+    for (const n of Object.values(b.codes)) expect(n).toBe(77);
+  });
 });
