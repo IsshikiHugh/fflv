@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LVF Player</title>
+    <meta name="description" content="Player for LVF layered video files (.lvd)" />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">LVF <span>layered video player</span></div>
+        <div id="file-name" class="file-name">no file loaded</div>
+        <label class="btn" for="file-input">Open .lvd…</label>
+        <input id="file-input" type="file" accept=".lvd,.lvf" hidden />
+      </header>
+
+      <main class="layout">
+        <section class="stage-col">
+          <div id="stage" class="stage">
+            <canvas id="view" width="1280" height="720"></canvas>
+            <div id="drop-hint" class="drop-hint">
+              <div>Drop an <b>.lvd</b> file here</div>
+              <small>or use “Open .lvd…”, or run <code>fflv view file.lvd</code>. Files are read in place, never uploaded.</small>
+            </div>
+            <div id="sync-banner" class="sync-banner" hidden></div>
+            <div id="status" class="status" hidden></div>
+          </div>
+
+          <div class="transport">
+            <button id="btn-back" class="icon" title="Previous frame (←)" aria-label="Previous frame">
+              <svg viewBox="0 0 24 24"><path d="M6 5h2v14H6zM20 5v14L9 12z" /></svg>
+            </button>
+            <button id="btn-play" class="icon play" title="Play / pause (Space)" aria-label="Play">
+              <svg class="i-play" viewBox="0 0 24 24"><path d="M7 4v16l13-8z" /></svg>
+              <svg class="i-pause" viewBox="0 0 24 24"><path d="M6 4h4v16H6zM14 4h4v16h-4z" /></svg>
+            </button>
+            <button id="btn-fwd" class="icon" title="Next frame (→)" aria-label="Next frame">
+              <svg viewBox="0 0 24 24"><path d="M16 5h2v14h-2zM4 5v14l11-7z" /></svg>
+            </button>
+            <input id="seek" class="seek" type="range" min="0" max="0" value="0" step="1" aria-label="Position" />
+            <div class="readout">
+              <span id="time">00:00.000</span><span class="dim"> / <span id="duration">00:00.000</span></span>
+            </div>
+            <div class="readout">
+              <span class="dim">frame</span> <span id="frame">0</span><span class="dim"> / <span id="frames">0</span></span>
+            </div>
+            <label class="toggle"><input id="loop" type="checkbox" /> loop</label>
+            <label class="toggle"><input id="mute" type="checkbox" /> mute</label>
+          </div>
+          <div id="notice" class="notice" hidden></div>
+        </section>
+
+        <aside class="side">
+          <h2>Layers <span class="hint">top → bottom</span></h2>
+          <ol id="layers" class="layers"></ol>
+          <details id="debug" class="debug">
+            <summary>Debug</summary>
+            <dl id="debug-list"></dl>
+            <label class="toggle"><input id="alpha-fix" type="checkbox" /> remap alpha 16–235 → 0–1</label>
+          </details>
+          <p class="keys">
+            <kbd>Space</kbd> play/pause · <kbd>←</kbd>/<kbd>→</kbd> frame step<br />
+            <kbd>1</kbd>–<kbd>9</kbd> toggle layer · <kbd>⇧</kbd>+<kbd>1</kbd>–<kbd>9</kbd> solo · <kbd>0</kbd> show all
+          </p>
+        </aside>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
