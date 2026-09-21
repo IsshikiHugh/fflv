@@ -11,6 +11,8 @@ use the invariant's own name ("I1" … "I10"); other codes:
 from __future__ import annotations
 
 import base64
+import json
+import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -282,10 +284,27 @@ def _validate(reader: LVFReader, rep: Report, check_bitstream: bool) -> Report:
         return rep
 
     # ---- metadata -----------------------------------------------------------------
+    # Must be standard JSON (RFC 8259) so every reader can parse it: browsers' JSON.parse rejects
+    # NaN / Infinity and treats a byte-order mark differently from Python.
+    raw = reader.meta_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        rep.add("META", "metadata starts with a UTF-8 byte-order mark")
+        rep.fatal = True
+        return rep
+
+    def non_standard(token: str):
+        raise ValueError(f"non-standard JSON constant {token}")
+
+    def finite(text: str) -> float:
+        v = float(text)
+        if not math.isfinite(v):
+            raise ValueError(f"number {text} is not finite")
+        return v
+
     try:
-        meta = reader.meta
+        meta = json.loads(raw.decode("utf-8"), parse_constant=non_standard, parse_float=finite)
     except (ValueError, UnicodeDecodeError) as exc:
-        rep.add("META", f"metadata is not valid UTF-8 JSON: {exc}")
+        rep.add("META", f"metadata is not valid UTF-8 JSON (RFC 8259): {exc}")
         rep.fatal = True
         return rep
     rep.meta = meta

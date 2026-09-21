@@ -145,7 +145,7 @@ def load_project(path: Path, output: str | None = None) -> Project:
                 raise PackError(f"{tag}: empty or negative interval [{start}, {end}) (frame_count {frame_count})")
             layers.append(Layer(
                 index=i, id=lid, name=str(L.get("name", lid)), kind=kind, src=src_path(L.get("src")),
-                z=L.get("z", i), rect=M.check_rect(L.get("rect")), start_frame=start, end_frame=end,
+                z=M.check_z(L.get("z", i)), rect=M.check_rect(L.get("rect")), start_frame=start, end_frame=end,
                 alpha=bool(L.get("alpha", False)), lossless=bool(L.get("lossless", False)),
                 blend=M.check_blend(L.get("blend", "normal")), opacity=M.check_opacity(L.get("opacity", 1.0)),
                 visible=bool(L.get("visible", True)),

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import numbers
 import re
 from fractions import Fraction
 
@@ -28,6 +30,10 @@ def check_id(layer_id: str, taken: set[str] = frozenset()) -> str:
     return layer_id
 
 
+def _is_integer(v) -> bool:
+    return isinstance(v, numbers.Integral) and not isinstance(v, bool)
+
+
 def check_rect(rect) -> dict:
     if isinstance(rect, dict):
         rect = [rect.get(k) for k in ("x", "y", "w", "h")]
@@ -37,12 +43,32 @@ def check_rect(rect) -> dict:
             rect = [int(v) for v in rect]
         except ValueError:
             raise MetaError(f"rect must be four integers x,y,w,h, got {rect!r}") from None
-    if not isinstance(rect, (list, tuple)) or len(rect) != 4 or not all(isinstance(v, int) for v in rect):
+    if hasattr(rect, "__iter__") and not isinstance(rect, (str, bytes, dict)):
+        rect = list(rect)  # tuples, numpy arrays, ...
+    if not isinstance(rect, list) or len(rect) != 4 or not all(_is_integer(v) for v in rect):
         raise MetaError(f"rect must be four integers [x, y, w, h], got {rect!r}")
-    x, y, w, h = rect
+    x, y, w, h = (int(v) for v in rect)  # plain ints (numpy integers are not JSON serializable)
     if w <= 0 or h <= 0:
         raise MetaError(f"rect width/height must be positive, got {rect!r}")
     return {"x": x, "y": y, "w": w, "h": h}
+
+
+def check_z(z) -> int | float:
+    """Drawing order: a finite number (numpy scalars and numeric strings accepted)."""
+    if isinstance(z, str):
+        try:
+            return int(z.strip())
+        except ValueError:
+            pass
+        try:
+            z = float(z)
+        except ValueError:
+            raise MetaError(f"z must be a number, got {z!r}") from None
+    if _is_integer(z):
+        return int(z)
+    if isinstance(z, bool) or not isinstance(z, numbers.Real) or not math.isfinite(float(z)):
+        raise MetaError(f"z must be a finite number, got {z!r}")
+    return float(z)
 
 
 def check_blend(blend: str) -> str:
@@ -87,7 +113,7 @@ def video_layer(*, id: str, name: str, z: float, rect: dict, start: int, end: in
                 visible: bool = True) -> dict:
     cw, ch = even(rect["w"]), even(rect["h"])
     cs = codec_string(cw, ch, float(fps), lossless=lossless)
-    d = {"id": id, "name": name, "kind": "video", "z": z, "rect": dict(rect),
+    d = {"id": id, "name": name, "kind": "video", "z": check_z(z), "rect": dict(rect),
          "start_frame": start, "end_frame": end,
          "codec": cs, "coded_width": cw, "coded_height": ch,
          "has_alpha": alpha, "alpha_codec": codec_string(cw, ch, float(fps)) if alpha else None}
@@ -105,7 +131,7 @@ def video_layer(*, id: str, name: str, z: float, rect: dict, start: int, end: in
 
 def still_layer(*, id: str, name: str, z: float, rect: dict, start: int, end: int, offset: int, length: int,
                 blend: str = "normal", opacity: float = 1.0, visible: bool = True) -> dict:
-    return {"id": id, "name": name, "kind": "still", "z": z, "rect": dict(rect),
+    return {"id": id, "name": name, "kind": "still", "z": check_z(z), "rect": dict(rect),
             "start_frame": start, "end_frame": end,
             "resource": {"offset": offset, "length": length, "mime": "image/png"},
             "blend": blend, "opacity": opacity, "visible": visible}
@@ -151,10 +177,7 @@ def apply_edits(meta: dict, key, fields: dict) -> dict:
         elif k == "name":
             L["name"] = str(v)
         elif k == "z":
-            try:
-                L["z"] = int(v) if str(v).lstrip("-").isdigit() else float(v)
-            except ValueError:
-                raise MetaError(f"z must be a number, got {v!r}") from None
+            L["z"] = check_z(v)
         elif k == "rect":
             L["rect"] = check_rect(v)
         elif k == "blend":

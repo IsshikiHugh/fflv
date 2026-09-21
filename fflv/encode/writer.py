@@ -113,7 +113,7 @@ class Writer:
         r = self._rect(rect)
         opts = EncodeOptions(crf=self.options.crf if crf is None else crf, speed=speed or self.options.speed)
         enc = LayerEncoder(r["w"], r["h"], self.fps, alpha=alpha, lossless=lossless, options=opts, name=id)
-        self._layers.append(_Video(id, name or id, len(self._layers) if z is None else z, r, alpha, lossless,
+        self._layers.append(_Video(id, name or id, len(self._layers) if z is None else M.check_z(z), r, alpha, lossless,
                                    M.check_blend(blend), M.check_opacity(opacity), bool(visible), enc))
 
     def add_still(self, id: str, image, *, rect=None, start: int = 0, end: int | None = None,
@@ -130,7 +130,7 @@ class Writer:
             rect = (0, 0, w, h)
         if start < 0 or (end is not None and end <= start):
             raise WriterError(f"still {id!r}: bad frame range [{start}, {end})")
-        self._layers.append(_Still(id, name or id, len(self._layers) if z is None else z, M.check_rect(rect), png,
+        self._layers.append(_Still(id, name or id, len(self._layers) if z is None else M.check_z(z), M.check_rect(rect), png,
                                    int(start), end, M.check_blend(blend), M.check_opacity(opacity), bool(visible)))
 
     def set_audio(self, src: str | os.PathLike, *, bitrate: str = "128k", channels: int = 2) -> None:

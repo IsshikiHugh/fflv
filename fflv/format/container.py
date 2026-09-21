@@ -18,8 +18,16 @@ from .binary import (
 from .constants import CAU_FLAG_RAP, HEADER_SIZE, INDEX_FLAG_RAP
 
 
+def _json_default(o):
+    item = getattr(o, "item", None)  # numpy scalars
+    if callable(item):
+        return item()
+    raise TypeError(f"{type(o).__name__} is not JSON serializable")
+
+
 def encode_meta(meta: dict) -> bytes:
-    return json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
+    """Standard JSON (RFC 8259): NaN / Infinity are refused rather than written as non-JSON."""
+    return json.dumps(meta, ensure_ascii=False, indent=2, allow_nan=False, default=_json_default).encode("utf-8")
 
 
 def meta_capacity_for(meta_bytes: bytes) -> int:
