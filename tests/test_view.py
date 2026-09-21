@@ -67,3 +67,50 @@ def test_viewer_url(server):
     assert url.startswith(base + "/?src=/media/") and url.endswith("&watch=1")
     st, _, body = get(base + "/")
     assert st == 200 and b"<html" in body.lower()
+
+
+def test_responses_stay_consistent_while_the_file_is_replaced(tmp_path):
+    """Writers rename a new version over the file (spec B.11). Every response must carry the bytes
+    of the same version as its ETag and Content-Range, or If-Match cannot detect the change."""
+    import os
+
+    versions = {0xAA: 300_000, 0xBB: 400_000}  # fill byte -> size
+    media = tmp_path / "watched.lvd"
+    media.write_bytes(bytes([0xAA]) * versions[0xAA])
+    srv = view.make_server(media, port=0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    stop = threading.Event()
+
+    def replace_forever():
+        n = 0
+        while not stop.is_set():
+            byte = (0xAA, 0xBB)[n % 2]
+            tmp = tmp_path / f".v{n % 2}"
+            tmp.write_bytes(bytes([byte]) * versions[byte])
+            os.replace(tmp, media)
+            n += 1
+
+    t = threading.Thread(target=replace_forever, daemon=True)
+    t.start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/media/watched.lvd"
+    bad, checked, versions_of_etag = [], 0, {}
+    try:
+        for i in range(1500):
+            st, h, body = get(url, {"Range": f"bytes={(i * 7919) % 250_000}-{(i * 7919) % 250_000 + 4095}"})
+            if st != 206:
+                continue
+            byte = body[0]
+            total = int(h["Content-Range"].split("/")[1])
+            if body != bytes([byte]) * len(body) or total != versions[byte]:
+                bad.append((i, hex(byte), total))  # bytes of one version, size of another
+            versions_of_etag.setdefault(h["ETag"], set()).add(byte)
+            checked += 1
+    finally:
+        stop.set()
+        t.join()
+        srv.shutdown()
+        srv.server_close()
+    assert checked > 1000
+    assert bad == [], f"{len(bad)} of {checked} responses mixed two versions, e.g. {bad[:3]}"
+    shared = {etag: sorted(map(hex, b)) for etag, b in versions_of_etag.items() if len(b) > 1}
+    assert not shared, f"one ETag was served with the bytes of different versions: {list(shared.items())[:3]}"

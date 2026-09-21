@@ -1,9 +1,13 @@
 """`fflv view FILE`: serve the web player and one .lvd on localhost and open Chrome / Edge.
 
 The player reads the file through HTTP range requests, only the parts it needs, like it does with
-a local File. Every response carries an ETag (size + mtime); the player sends it back with
+a local File. Every response carries an ETag (inode + size + mtime); the player sends it back with
 If-Match, and polls it, so when the file is rewritten (a new debug run, `fflv add`, `fflv set`, …)
 the page reloads the file and keeps the current frame and layer settings.
+
+Each request opens the file once and takes the ETag, the size and the bytes from that one open
+file, so a response can never mix the ETag of one version with the bytes of another — even while
+the file is being replaced (writers rename a finished file over it, spec B.11).
 """
 
 from __future__ import annotations
@@ -29,9 +33,9 @@ class ViewError(RuntimeError):
     pass
 
 
-def etag_of(path: Path) -> str:
-    st = path.stat()
-    return f'"{st.st_size:x}-{st.st_mtime_ns:x}"'
+def etag_of(st: os.stat_result) -> str:
+    """Changes whenever the file is replaced (inode) or rewritten in place (size, mtime)."""
+    return f'"{st.st_ino:x}-{st.st_size:x}-{st.st_mtime_ns:x}"'
 
 
 class _Server(ThreadingHTTPServer):
@@ -71,16 +75,20 @@ class _Handler(SimpleHTTPRequestHandler):
 
     def _media(self, head: bool) -> None:
         name = unquote(urlsplit(self.path).path[len("/media/"):])
-        path = self.server.media
-        if name != self.server.media_name or not path.exists():
+        if name != self.server.media_name:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         try:
-            etag = etag_of(path)
-            size = path.stat().st_size
+            f = open(self.server.media, "rb")
         except OSError:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
+        with f:
+            self._serve(f, head)
+
+    def _serve(self, f, head: bool) -> None:
+        st = os.fstat(f.fileno())  # ETag, size and bytes all come from this one open file
+        etag, size = etag_of(st), st.st_size
         want = self.headers.get("If-Match")
         if want and want.strip() != etag:
             self.send_response(HTTPStatus.PRECONDITION_FAILED)
@@ -119,15 +127,14 @@ class _Handler(SimpleHTTPRequestHandler):
         if head:
             return
         try:
-            with open(path, "rb") as f:
-                f.seek(start)
-                left = end - start
-                while left > 0:
-                    buf = f.read(min(_CHUNK, left))
-                    if not buf:
-                        break
-                    self.wfile.write(buf)
-                    left -= len(buf)
+            f.seek(start)
+            left = end - start
+            while left > 0:
+                buf = f.read(min(_CHUNK, left))
+                if not buf:
+                    break
+                self.wfile.write(buf)
+                left -= len(buf)
         except (BrokenPipeError, ConnectionResetError):
             pass
 

@@ -530,6 +530,7 @@ The edit is instant whatever the file size. It works whenever the old and the ne
 - Images are checked before any state changes, so a rejected image leaves the writer as it was. If encoding fails inside `write()`, the layers' encoders may be out of step with the file, so the writer refuses to continue (`write()` / `close()` raise; `abort()` discards the file).
 
 **B.9 `fflv view`**. A local HTTP server (listening on 127.0.0.1 only) serves the player and the file, with Range and ETag support.
+- The ETag is derived from the file's inode, size and modification time, so it changes when the file is replaced (B.11) or rewritten in place (B.5). Each request opens the file once and takes the ETag, the size and the bytes from that one open file, so a response never mixes the ETag of one version with the bytes of another.
 - The player sends `If-Match` with every range read; when the file has been replaced, the server answers 412 and the player reloads instead.
 - The player polls the ETag once a second and reloads automatically when the file changes. A reload keeps the current frame, the play state, and the layer settings the user changed in the UI; everything else takes the new file's defaults.
 
