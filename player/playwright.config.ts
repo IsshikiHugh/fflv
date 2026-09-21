@@ -1,0 +1,25 @@
+import { defineConfig } from '@playwright/test';
+
+const port = 4791;
+
+export default defineConfig({
+  testDir: 'e2e',
+  timeout: 180_000,
+  workers: 1,
+  reporter: [['list']],
+  use: {
+    baseURL: `http://127.0.0.1:${port}`,
+    launchOptions: { args: ['--autoplay-policy=no-user-gesture-required'] },
+  },
+  // `fflv view` serves the built player (fflv/viewer) and the test file with range requests.
+  // Run inside the Python environment that has fflv installed, or set FFLV_PYTHON.
+  webServer: {
+    command: `${process.env.FFLV_PYTHON ?? 'python'} -m fflv view ../test_assets/test.lvd --port ${port} --no-open`,
+    url: `http://127.0.0.1:${port}/`,
+    reuseExistingServer: false,
+  },
+  projects: [
+    { name: 'chromium', use: { browserName: 'chromium' } },
+    { name: 'msedge', use: { browserName: 'chromium', channel: 'msedge' } },
+  ],
+});
