@@ -26,7 +26,8 @@ import av
 from . import meta as M
 from .encode.audio import AudioTrack, encode_audio
 from .encode.media import MediaError, VideoSource, input_args, layer_filter, open_video_source, run, still_png
-from .format import Cau, LVFWriter, Report, VideoEntry, parse_fps, pts_us, seconds_to_frame, validate
+from .format import Cau, LVFWriter, Report, VideoEntry, parse_fps, pts_us, seconds_to_frame
+from .format.output import InvalidOutput, publish, temp_path_for
 from .format.constants import CAU_FLAG_RAP, ENTRY_EMPTY, ENTRY_FRAME, FILE_EXTENSION, FRAME_FLAG_KEY
 from .format.vp9 import Vp9Error, inspect_packet
 
@@ -293,13 +294,13 @@ def build_meta(proj: Project, audio: AudioTrack | None) -> dict:
                        audio=audio.meta() if audio else None)
 
 
-def write_file(proj: Project, audio: AudioTrack | None, raps: list[bool]) -> None:
+def write_file(proj: Project, audio: AudioTrack | None, raps: list[bool], path: Path) -> None:
     meta = build_meta(proj, audio)
     resources = b"".join(L.png for L in proj.layers if L.kind == "still")
     video = [L for L in proj.layers if L.kind == "video"]
     num, den = proj.fps.numerator, proj.fps.denominator
-    proj.output.parent.mkdir(parents=True, exist_ok=True)
-    w = LVFWriter(proj.output)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    w = LVFWriter(path)
     iters = {}
     try:
         w.begin(meta, resources)
@@ -380,14 +381,19 @@ def pack(project_path: str | Path, output: str | None = None, *, jobs: int = 4, 
         if audio:
             log(f"  audio: {len(audio.packets)} Opus packets, {audio.channels} ch, pre-skip {audio.pre_skip}")
         log(f"writing {proj.output} ...")
-        write_file(proj, audio, raps)
+        # Written beside the output, validated, then renamed over it: a viewer watching the output
+        # (fflv view) never sees a half-written file, and a failed pack keeps the previous file.
+        part = temp_path_for(proj.output)
+        write_file(proj, audio, raps, part)
+        rep = publish(part, proj.output)
     except MediaError as exc:
+        raise PackError(str(exc)) from exc
+    except InvalidOutput as exc:
         raise PackError(str(exc)) from exc
     finally:
         if keep_temp:
             log(f"  temp files kept in {tmp}")
         else:
             shutil.rmtree(tmp, ignore_errors=True)
-    rep = validate(str(proj.output))
     log(f"total {time.monotonic() - t0:.1f} s")
     return rep

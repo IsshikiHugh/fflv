@@ -68,11 +68,14 @@ def open_video_source(src: str | Path) -> VideoSource:
 
 def layer_filter(fps: Fraction, w: int, h: int) -> list[str]:
     """Common filter chain: constant frame rate, scale to the layer rect, pad to even dimensions by
-    repeating the last row/column (the padding is cropped again on playback)."""
+    repeating the last row/column (the padding is cropped again on playback, spec B.4).
+
+    The padding is done in 4:4:4 RGB (gbrap): on a chroma-subsampled frame of odd size, FFmpeg's
+    `pad` rounds the input size down to even, dropping the real last row/column and filling black."""
     chain = [f"fps={fps.numerator}/{fps.denominator}", f"scale={w}:{h}:flags=bicubic", "setsar=1"]
     pw, ph = w & 1, h & 1
     if pw or ph:
-        chain += [f"pad={w + pw}:{h + ph}:0:0",
+        chain += ["format=gbrap", f"pad={w + pw}:{h + ph}:0:0",
                   f"fillborders=left=0:right={pw}:top=0:bottom={ph}:mode=smear"]
     return chain
 

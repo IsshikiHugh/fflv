@@ -96,3 +96,59 @@ def test_pack_rejects_alpha_request_on_opaque_source(packed, tmp_path):
     p.write_text(json.dumps(proj))
     with pytest.raises(PackError, match="no alpha channel"):
         pack(p, str(tmp_path / "x.lvd"), jobs=1, log=lambda s: None)
+
+
+def _ffmpeg(*args):
+    import subprocess
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *map(str, args)], check=True)
+
+
+@pytest.mark.parametrize("lossless", [False, True])
+def test_pack_pads_odd_layers_by_repeating_the_edge(tmp_path, lossless):
+    """Odd rects from 4:2:0 sources: the last row/column must keep the real content (spec B.4),
+    and a transparent source must stay transparent there."""
+    import json
+
+    import fflv
+
+    _ffmpeg("-f", "lavfi", "-i", "color=c=red:s=64x48:r=30:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            tmp_path / "red.mp4")
+    _ffmpeg("-f", "lavfi", "-i", "color=c=red@0.0:s=64x48:r=30:d=1,format=yuva420p", "-c:v", "libvpx-vp9",
+            "-pix_fmt", "yuva420p", "-auto-alt-ref", "0", tmp_path / "clear.webm")
+    proj = {"canvas": {"width": 80, "height": 60}, "fps": "30/1", "duration": 1, "gop": 30, "layers": [
+        {"id": "red", "src": "red.mp4", "rect": [0, 0, 63, 47], "lossless": lossless},
+        {"id": "clear", "src": "clear.webm", "rect": [0, 0, 63, 47], "alpha": True, "lossless": lossless}]}
+    (tmp_path / "p.json").write_text(json.dumps(proj))
+    out = tmp_path / "odd.lvd"
+    assert pack(tmp_path / "p.json", str(out), log=lambda s: None).ok
+    with fflv.open(out) as r:
+        assert r.layer("red").content_size == (63, 47)
+        _, red = next(r.layer_frames("red"))
+        _, clear = next(r.layer_frames("clear"))
+    assert red.shape == (47, 63, 4)
+    assert red[:, :, 0].min() > 200 and red[:, :, 1].max() < 40, "edge pixels lost their color"
+    assert clear[:, :, 3].max() <= 3, "a transparent source became opaque at the padded edge"
+
+
+def test_pack_replaces_the_output_atomically(packed, tmp_path, monkeypatch):
+    """A failure while writing leaves the previous file untouched and no temporary file behind."""
+    import shutil
+
+    import fflv.project as project
+    from fflv.format import LVFWriter
+
+    out = tmp_path / "keep.lvd"
+    shutil.copy(packed["path"], out)
+    before = out.read_bytes()
+    real = LVFWriter.write_cau
+
+    def failing(self, cau, *a, **kw):
+        if len(self.index) == 50:
+            raise RuntimeError("disk full")
+        return real(self, cau, *a, **kw)
+
+    monkeypatch.setattr(LVFWriter, "write_cau", failing)
+    with pytest.raises(RuntimeError, match="disk full"):
+        project.pack(packed["dir"] / "test_project.json", str(out), log=lambda s: None)
+    assert out.read_bytes() == before
+    assert not list(tmp_path.glob(".*fflv-tmp"))

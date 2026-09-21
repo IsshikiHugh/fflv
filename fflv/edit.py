@@ -28,7 +28,8 @@ from . import meta as M
 from .encode.audio import AudioTrack, encode_audio
 from .encode.media import open_video_source, png_size, raw_frames, still_png
 from .encode.vp9enc import EncodeOptions, LayerEncoder
-from .format import Cau, LVFReader, LVFWriter, Report, VideoEntry, encode_meta, pts_us, rewrite_meta_in_place, validate
+from .format import Cau, LVFReader, LVFWriter, Report, VideoEntry, encode_meta, pts_us, rewrite_meta_in_place
+from .format.output import InvalidOutput, publish, temp_path_for
 from .format.constants import CAU_FLAG_RAP, ENTRY_EMPTY, ENTRY_FRAME, FRAME_FLAG_KEY
 
 
@@ -51,10 +52,6 @@ class _NewStill:
 KEEP = "keep"
 
 
-def _tmp_path(dst: Path) -> Path:
-    return dst.with_name(f".{dst.name}.fflv-tmp")
-
-
 def remux(src: str | os.PathLike, dst: str | os.PathLike | None = None, *, drop: Iterable[int] = (),
           add_video: Iterable[_NewVideo] = (), add_still: Iterable[_NewStill] = (),
           audio: str | AudioTrack | None = KEEP, meta_patch: Callable[[dict], None] | None = None,
@@ -63,7 +60,7 @@ def remux(src: str | os.PathLike, dst: str | os.PathLike | None = None, *, drop:
     src, dst = Path(src), Path(dst) if dst is not None else Path(src)
     drop = set(drop)
     add_video, add_still = list(add_video), list(add_still)
-    tmp = _tmp_path(dst)
+    tmp = temp_path_for(dst)
     with LVFReader(src) as r:
         meta = copy.deepcopy(r.meta)
         num, den = meta["fps"]["num"], meta["fps"]["den"]
@@ -135,14 +132,10 @@ def remux(src: str | os.PathLike, dst: str | os.PathLike | None = None, *, drop:
         except BaseException:
             w.abort()
             raise
-    rep = None
-    if check:
-        rep = validate(str(tmp))
-        if not rep.ok:
-            tmp.unlink(missing_ok=True)
-            raise EditError("edited file failed validation: " + "; ".join(str(i) for i in rep.errors[:5]))
-    os.replace(tmp, dst)
-    return rep
+    try:
+        return publish(tmp, dst, check=check)
+    except InvalidOutput as exc:
+        raise EditError(str(exc)) from exc
 
 
 # --------------------------------------------------------------------------------------------------
