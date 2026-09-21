@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fflv"
+version = "0.1.0"
+description = "LVF layered video (.lvd): pack, edit, decode, render and view — a small ffmpeg-like toolkit for debugging with layers"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["av>=12", "numpy>=1.23"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+fflv = "fflv.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["fflv*"]
+
+[tool.setuptools.package-data]
+fflv = ["viewer/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
