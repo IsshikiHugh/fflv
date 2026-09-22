@@ -1,26 +1,26 @@
 [build-system]
-requires = ["setuptools>=64"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
 
 [project]
 name = "fflv"
-version = "0.1.0"
 description = "LVF layered video (.lvd): pack, edit, decode, render and view — a small ffmpeg-like toolkit for debugging with layers"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = ["av>=12", "numpy>=1.23"]
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
+dynamic = ["version"]
 
 [project.optional-dependencies]
 test = ["pytest"]
 
 [project.scripts]
-fflv = "fflv.cli:main"
+fflv = "fflv.cli:entry"
 
-[tool.setuptools.packages.find]
-include = ["fflv*"]
-
-[tool.setuptools.package-data]
-fflv = ["viewer/**/*"]
+[tool.maturin]
+manifest-path = "crates/fflv-python/Cargo.toml"
+python-source = "python"
+module-name = "fflv._fflv"
+features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

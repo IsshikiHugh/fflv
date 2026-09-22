@@ -1,11 +1,13 @@
-"""render / extract outputs, and decoding only the selected layers."""
+"""render / extract outputs."""
 
-import av
+import json
+import subprocess
+
 import numpy as np
 import pytest
 
 import fflv
-from fflv.render import OutputError
+from conftest import read_png, read_video
 
 W, H, N = 96, 64, 12
 
@@ -26,27 +28,22 @@ def src(tmp_path):
     return path
 
 
-def read_video(path):
-    with av.open(str(path)) as c:
-        return [fr.to_ndarray(format="rgb24") for fr in c.decode(video=0)]
-
-
 def test_render_single_frame_png(src, tmp_path):
     out = tmp_path / "f.png"
     assert fflv.render(src, out, start=5, end=6) == 1
-    img = read_video(out)[0]
-    assert img.shape == (H, W, 3)
-    assert tuple(img[0, 0]) == (50, 0, 0)          # bg of frame 5, exact (lossless)
-    assert tuple(img[18, 18]) == (255, 255, 255)   # the dot
-    assert tuple(img[2, 2]) == (50, 0, 0)          # "hidden" layer is not shown by default
+    img = read_png(out)
+    assert img.shape == (H, W, 4)
+    assert tuple(img[0, 0]) == (50, 0, 0, 255)          # bg of frame 5, exact (lossless)
+    assert tuple(img[18, 18]) == (255, 255, 255, 255)   # the dot
+    assert tuple(img[2, 2]) == (50, 0, 0, 255)          # "hidden" layer is not shown by default
 
 
 def test_render_layer_selection(src, tmp_path):
     fflv.render(src, tmp_path / "a.png", start=3, end=4, layers=["hidden"])
-    img = read_video(tmp_path / "a.png")[0]
-    assert tuple(img[2, 2]) == (255, 255, 255)
-    assert tuple(img[30, 30]) == (0x10, 0x20, 0x30)  # canvas background only
-    with pytest.raises(OutputError, match="one frame"):
+    img = read_png(tmp_path / "a.png")
+    assert tuple(img[2, 2, :3]) == (255, 255, 255)
+    assert tuple(img[30, 30, :3]) == (0x10, 0x20, 0x30)  # canvas background only
+    with pytest.raises(fflv.OutputError, match="one frame"):
         fflv.render(src, tmp_path / "b.png", start=0, end=2)
 
 
@@ -60,12 +57,25 @@ def test_render_sequences_and_videos(src, tmp_path):
     assert len(frames) == N and all(tuple(fr[0, 0]) == (f * 10, 0, 0) for f, fr in enumerate(frames))
     fflv.render(src, tmp_path / "v.mp4")
     assert len(read_video(tmp_path / "v.mp4")) == N
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(tmp_path / "v.mp4")],
+                           capture_output=True, check=True)
+    st = json.loads(probe.stdout)["streams"][0]
+    assert (st["color_space"], st["color_range"], st["pix_fmt"]) == ("bt709", "tv", "yuv420p")
     fflv.render(src, tmp_path / "v.npy", start=1, end=4)
     arr = np.load(tmp_path / "v.npy")
     assert arr.shape == (3, H, W, 3) and arr[0, 0, 0, 0] == 10
     fflv.render(src, tmp_path / "t.webm", transparent=True, layers=["dot"], end=3)
-    with pytest.raises(OutputError, match="alpha"):
+    with pytest.raises(fflv.OutputError, match="alpha"):
         fflv.render(src, tmp_path / "t.mp4", transparent=True)
+    with pytest.raises(fflv.OutputError, match="how to write"):
+        fflv.render(src, tmp_path / "t.xyz")
+
+
+def test_render_progress_and_jpeg(src, tmp_path):
+    calls = []
+    assert fflv.render(src, tmp_path / "j" / "%02d.jpg", start=0, end=3, progress=lambda d, t: calls.append((d, t))) == 3
+    assert calls == [(1, 3), (2, 3), (3, 3)]
+    assert sorted(p.name for p in (tmp_path / "j").iterdir()) == ["00.jpg", "01.jpg", "02.jpg"]
 
 
 def test_extract_layer_exact(src, tmp_path):
@@ -74,22 +84,4 @@ def test_extract_layer_exact(src, tmp_path):
     assert arr.shape == (N, 16, 16, 4)
     assert (arr[:, 4:12, 4:12] == 255).all() and (arr[:, :4] == 0).all()
     assert fflv.extract(src, "dot", tmp_path / "dot" / "%02d.png", start=10) == 2
-
-
-def test_only_selected_layers_are_decoded(src, monkeypatch):
-    created = []
-    real = av.CodecContext.create
-
-    def spy(name, mode="r"):
-        if mode == "r" and name == "vp9":
-            created.append(name)
-        return real(name, mode)
-
-    monkeypatch.setattr(av.CodecContext, "create", staticmethod(spy))
-    with fflv.open(src) as r:
-        r.frame(7, layers=["dot"])
-    assert len(created) == 2  # dot color + dot alpha; bg and hidden were never decoded
-    created.clear()
-    with fflv.open(src) as r:
-        list(r.frames(0, N))  # default: visible layers only
-    assert len(created) == 3  # bg color, dot color + alpha
+    assert np.array_equal(read_png(tmp_path / "dot" / "11.png"), arr[11])

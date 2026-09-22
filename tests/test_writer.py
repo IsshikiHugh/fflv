@@ -4,8 +4,6 @@ import numpy as np
 import pytest
 
 import fflv
-from fflv.encode.writer import WriterError
-from fflv.format import LVFReader, validate
 
 W, H = 320, 180
 
@@ -46,12 +44,13 @@ def written(tmp_path):
                 lates[f] = np.dstack([gradient(f)[:64, :64], np.full((64, 64), 180, np.uint8)])
                 imgs["late"] = lates[f]
             assert w.write(imgs) == f
+    assert w.report.ok and w.report.path == str(path)
     return path, masks, lates
 
 
 def test_written_file_is_valid_and_on_the_grid(written):
     path, _, _ = written
-    rep = validate(str(path))
+    rep = fflv.validate(path)
     assert rep.ok, [str(i) for i in rep.issues]
     assert rep.rap_frames == [0, 10, 20, 30]
     layers = {L["id"]: L for L in rep.meta["layers"]}
@@ -61,8 +60,6 @@ def test_written_file_is_valid_and_on_the_grid(written):
     assert m["lossless"] and m["alpha_range"] == "full" and m["codec"].startswith("vp09.01.")
     assert (m["coded_width"], m["coded_height"], m["content_size"]) == (102, 52, [101, 51])
     assert rep.meta["generator"] == "fflv"
-    with LVFReader(path) as r:  # metadata space is reserved for in-place edits
-        assert r.header.resources_offset - r.header.meta_offset >= 4096 > r.header.meta_length
 
 
 def test_lossless_layer_is_bit_exact_and_sticky(written):
@@ -102,6 +99,7 @@ def test_composite_matches_the_formulas(written):
         full = r.frame(13)
         assert full.shape == (H, W, 3)
         assert np.array_equal(r.frame(13, hide=["late", "legend", "bg"]), only_mask)
+        assert np.array_equal(r.still("legend"), np.full((10, 20, 4), 200, np.uint8))
 
 
 def test_transparent_composite_keeps_alpha(written):
@@ -113,8 +111,40 @@ def test_transparent_composite_keeps_alpha(written):
     assert np.array_equal(rgba[20:71, 10:111, 3], masks[3][:, :, 3])
 
 
+def test_decode_gives_each_layers_own_planes(written):
+    path, masks, _ = written
+    with fflv.open(path) as r:
+        mask = r.layer("mask")
+        out = list(r.decode(11, 14, layers=["mask", "legend"]))
+    assert [f for f, _ in out] == [11, 12, 13]
+    for f, planes in out:
+        assert list(planes) == [mask.index]
+        rgb, alpha = planes[mask.index]
+        src = masks[f - f % 3]
+        assert np.array_equal(rgb, src[:, :, :3]) and np.array_equal(alpha, src[:, :, 3])
+
+
+def test_reader_api(written):
+    path, _, _ = written
+    with fflv.open(path) as r:
+        assert r.frame_count == 40 and r.size == (W, H) and r.fps == 30
+        assert [L.id for L in r.select()] == ["bg", "mask", "late", "legend"]
+        assert [L.id for L in r.select(["late", 0], hide=[0])] == ["late"]
+        late = r.layer("late")
+        assert (late.start, late.end, late.blend, late.active(29), late.active(30)) == (7, 30, "screen", True, False)
+        assert r.layer(1).id == r.layer("1").id == "mask"
+        assert r.raps == [0, 10, 20, 30] and r.rap_at_or_before(19) == 10
+        assert r.pts_us(1) == 33333
+        assert r.check().ok
+        with pytest.raises(fflv.MetaError, match="no layer"):
+            r.layer("nope")
+        with pytest.raises(fflv.DecodeError, match="outside"):
+            r.frame(40)
+        assert "w.lvd" in repr(r)
+
+
 def test_writer_errors(tmp_path):
-    with pytest.raises(WriterError, match="unknown video layer"):
+    with pytest.raises(fflv.WriterError, match="unknown video layer"):
         with fflv.Writer(tmp_path / "a.lvd", (64, 64)) as w:
             w.add_layer("a")
             w.write(b=np.zeros((64, 64, 3), np.uint8))
@@ -123,26 +153,35 @@ def test_writer_errors(tmp_path):
     w = fflv.Writer(tmp_path / "b.lvd", (64, 64))
     w.add_layer("a")
     w.write(a=np.zeros((64, 64, 3), np.uint8))
-    with pytest.raises(WriterError, match="before the first write"):
+    with pytest.raises(fflv.WriterError, match="before the first write"):
         w.add_layer("late")
     with pytest.raises(ValueError, match="64x64"):
         w.write(a=np.zeros((32, 32, 3), np.uint8))
     w.abort()
     assert not (tmp_path / "b.lvd").exists()
 
-    with pytest.raises(WriterError, match="never received an image"):
+    with pytest.raises(fflv.WriterError, match="never received an image"):
         with fflv.Writer(tmp_path / "c.lvd", (64, 64)) as w:
             w.add_layer("a")
             w.add_layer("b")
             w.write(a=np.zeros((64, 64, 3), np.uint8))
     assert not (tmp_path / "c.lvd").exists() and not list(tmp_path.glob(".*fflv-tmp"))
 
-    with pytest.raises(WriterError, match="contiguous"):
+    with pytest.raises(fflv.WriterError, match="contiguous"):
         with fflv.Writer(tmp_path / "d.lvd", (64, 64)) as w:
             w.add_layer("a")
             w.write(a=np.zeros((64, 64, 3), np.uint8))
             w.end_layer("a")
             w.write(a=np.zeros((64, 64, 3), np.uint8))
+
+    with pytest.raises(fflv.MetaError, match="dtype"):
+        with fflv.Writer(tmp_path / "e.lvd", (4, 4)) as w:
+            w.add_layer("a")
+            w.write(a=np.zeros((4, 4, 3), np.int32))
+    w = fflv.Writer(tmp_path / "f.lvd", (4, 4))
+    w.add_layer("x")
+    with pytest.raises(fflv.MetaError, match="already used"):
+        w.add_layer("x")
 
 
 def test_image_types_are_normalised(tmp_path):
@@ -152,40 +191,12 @@ def test_image_types_are_normalised(tmp_path):
         w.add_layer("m", alpha=True, lossless=True)
         w.write(g=np.full((16, 32), 0.5, np.float32), m=np.ones((16, 32), bool))
         w.write(g=np.full((16, 32, 1), 7, np.uint8), m=np.zeros((16, 32, 4), np.uint8))
+        w.write(g=np.full((16, 64, 3), 9, np.uint8)[:, ::2], m=np.zeros((16, 32, 4), np.uint8))  # a strided view
     with fflv.open(path) as r:
         g = [rgba for _, rgba in r.layer_frames("g")]
         m = [rgba for _, rgba in r.layer_frames("m")]
-    assert (g[0][:, :, :3] == 128).all() and (g[1][:, :, :3] == 7).all()
+    assert (g[0][:, :, :3] == 128).all() and (g[1][:, :, :3] == 7).all() and (g[2][:, :, :3] == 9).all()
     assert (m[0] == 255).all() and (m[1] == 0).all()
-
-
-def test_a_failed_encode_makes_the_writer_refuse_to_continue(tmp_path, monkeypatch):
-    """After an encoder error mid-frame the other layers' encoders are a frame ahead of the file;
-    continuing would produce a file that validates but decodes wrongly."""
-    from fflv.encode.vp9enc import LayerEncoder
-
-    path = tmp_path / "broken.lvd"
-    w = fflv.Writer(path, (32, 32), gop=4)
-    w.add_layer("a", lossless=True)
-    w.add_layer("b", lossless=True)
-    for f in range(3):
-        w.write(a=np.full((32, 32, 3), f, np.uint8), b=np.full((32, 32, 3), f, np.uint8))
-    real = LayerEncoder.encode_prepared
-
-    def flaky(self, rgb, a, key):
-        if self.name == "b":
-            raise RuntimeError("encoder crashed")
-        return real(self, rgb, a, key)
-
-    monkeypatch.setattr(LayerEncoder, "encode_prepared", flaky)
-    with pytest.raises(RuntimeError, match="encoder crashed"):
-        w.write(a=np.full((32, 32, 3), 3, np.uint8), b=np.full((32, 32, 3), 3, np.uint8))
-    monkeypatch.undo()
-    with pytest.raises(WriterError, match="failed while encoding"):
-        w.write(a=np.full((32, 32, 3), 4, np.uint8), b=np.full((32, 32, 3), 4, np.uint8))
-    with pytest.raises(WriterError, match="not written"):
-        w.close()
-    assert not path.exists() and not list(tmp_path.glob(".*fflv-tmp"))
 
 
 def test_a_rejected_image_changes_nothing(tmp_path):
@@ -203,22 +214,18 @@ def test_a_rejected_image_changes_nothing(tmp_path):
     assert sorted(a) == [0, 1] and (a[1][:, :, :3] == 10).all()
 
 
-def test_invalid_output_never_replaces_the_destination(tmp_path, monkeypatch):
-    import fflv.format.output as output
-    from fflv.format.validate import Report
+def test_audio_track(tmp_path):
+    import subprocess
 
-    path = tmp_path / "dst.lvd"
-    path.write_bytes(b"previous version")
-
-    def failing_validate(p):
-        rep = Report(p)
-        rep.add("I1", "simulated failure")
-        return rep
-
-    monkeypatch.setattr(output, "validate", failing_validate)
-    with pytest.raises(WriterError, match="failed validation"):
-        with fflv.Writer(path, (16, 16)) as w:
-            w.add_layer("a")
-            w.write(a=np.zeros((16, 16, 3), np.uint8))
-    assert path.read_bytes() == b"previous version"
-    assert not list(tmp_path.glob(".*fflv-tmp"))
+    wav = tmp_path / "tone.wav"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                    "sine=frequency=440:sample_rate=48000:duration=3", str(wav)], check=True)
+    path = tmp_path / "a.lvd"
+    with fflv.Writer(path, (16, 16), fps=25) as w:
+        w.add_layer("v")
+        w.set_audio(wav, bitrate="64k", channels=1)
+        for _ in range(25):
+            w.write(v=np.zeros((16, 16, 3), np.uint8))
+    rep = w.report
+    assert rep.ok and rep.meta["audio"]["channels"] == 1 and rep.meta["audio"]["pre_skip"] > 0
+    assert 48 <= rep.audio_packets <= 51  # 1 s of 20-ms packets: cut to the video

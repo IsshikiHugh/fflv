@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/lvf", "crates/vpx-sys", "crates/fflv"]
+members = ["crates/lvf", "crates/vpx-sys", "crates/fflv", "crates/fflv-python"]
 
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
 license = "MIT"
-rust-version = "1.82"
+rust-version = "1.83"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

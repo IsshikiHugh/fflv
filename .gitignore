@@ -5,12 +5,16 @@ test_assets/
 __pycache__/
 .pytest_cache/
 *.egg-info/
+# the compiled extension (maturin develop puts it beside the Python sources)
+python/fflv/*.so
+python/fflv/*.pyd
 # interrupted writes / edits
 .*.fflv-tmp
 # player
 player/node_modules/
 player/dist/
-# note: fflv/viewer/ (the built player) IS kept, so `pip install` works without Node
+# note: crates/fflv/viewer/ (the built player) IS kept: it is compiled into the fflv binary,
+# so building fflv does not need Node
 player/test-results/
 player/playwright-report/
 # rust
