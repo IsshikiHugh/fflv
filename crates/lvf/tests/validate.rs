@@ -187,7 +187,7 @@ fn the_synthetic_file_is_valid() {
     assert_eq!(rep.rap_frames, vec![0, 10, 20, 30]);
     assert_eq!(rep.layer_stats[&2].frames, 20);
     assert_eq!(rep.layer_stats[&2].keyframes, 3); // 15, 20, 30
-    let mut r = LvfReader::open(&path).unwrap();
+    let r = LvfReader::open(&path).unwrap();
     let m = r.meta().unwrap();
     assert_eq!(m.layers[2].content_size, Some([21, 13]));
     assert_eq!(r.caus(None, None).count(), N as usize);
@@ -332,7 +332,7 @@ fn metadata_must_be_standard_json() {
 #[test]
 fn copy_on_write_metadata_edits_survive_a_crash() {
     let path = build("cow.lvd", |_| {}, |_| {});
-    let mut r = LvfReader::open(&path).unwrap();
+    let r = LvfReader::open(&path).unwrap();
     let mut m = r.meta().unwrap();
     let (cap, len) = (r.header.resources_offset - HEADER_SIZE as u64, r.header.meta_length as u64);
     drop(r);

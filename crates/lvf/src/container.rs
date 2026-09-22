@@ -2,6 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -124,6 +125,8 @@ impl LvfWriter {
 // ------------------------------------------------------------------------------------------------
 // Reader
 // ------------------------------------------------------------------------------------------------
+/// Random-access reader. Reads are positional (no shared file cursor), so one reader can be shared
+/// between threads, e.g. behind an `Arc`.
 pub struct LvfReader {
     f: File,
     pub path: PathBuf,
@@ -131,61 +134,92 @@ pub struct LvfReader {
     pub header: FileHeader,
 }
 
+#[cfg(unix)]
+fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match f.seek_read(buf, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 impl LvfReader {
     pub fn open(path: impl AsRef<Path>) -> Result<LvfReader> {
         let path = path.as_ref().to_path_buf();
-        let mut f = File::open(&path)?;
+        let f = File::open(&path)?;
+        LvfReader::from_file(f, path)
+    }
+
+    /// Read an already open file (its size and bytes come from this one open file).
+    pub fn from_file(f: File, path: PathBuf) -> Result<LvfReader> {
         let file_size = f.metadata()?.len();
         let mut hb = [0u8; HEADER_SIZE];
         if file_size < HEADER_SIZE as u64 {
             return format_err(format!("file header needs {HEADER_SIZE} bytes, file has {file_size}"));
         }
-        f.read_exact(&mut hb)?;
+        read_at(&f, &mut hb, 0)?;
         Ok(LvfReader { f, path, file_size, header: FileHeader::unpack(&hb)? })
     }
 
-    pub fn read(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
+    pub fn file(&self) -> &File {
+        &self.f
+    }
+
+    pub fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         if offset + len as u64 > self.file_size {
             return format_err(format!("short read: wanted {len} bytes at {offset}, file has {}", self.file_size));
         }
         let mut buf = vec![0u8; len];
-        self.f.seek(SeekFrom::Start(offset))?;
-        self.f.read_exact(&mut buf)?;
+        read_at(&self.f, &mut buf, offset)?;
         Ok(buf)
     }
 
-    pub fn meta_bytes(&mut self) -> Result<Vec<u8>> {
+    pub fn meta_bytes(&self) -> Result<Vec<u8>> {
         let (o, l) = (self.header.meta_offset, self.header.meta_length as usize);
         self.read(o, l)
     }
 
-    pub fn meta_json(&mut self) -> Result<serde_json::Value> {
+    pub fn meta_json(&self) -> Result<serde_json::Value> {
         let b = self.meta_bytes()?;
         serde_json::from_slice(&b).map_err(|e| Error::Format(format!("metadata is not valid JSON: {e}")))
     }
 
-    pub fn meta(&mut self) -> Result<Meta> {
+    pub fn meta(&self) -> Result<Meta> {
         let b = self.meta_bytes()?;
         serde_json::from_slice(&b).map_err(|e| Error::Format(format!("metadata does not match the LVF schema: {e}")))
     }
 
-    pub fn resource(&mut self, offset: u64, len: u64) -> Result<Vec<u8>> {
+    pub fn resource(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
         let o = self.header.resources_offset + offset;
         self.read(o, len as usize)
     }
 
-    pub fn resources(&mut self) -> Result<Vec<u8>> {
+    pub fn resources(&self) -> Result<Vec<u8>> {
         let (a, b) = (self.header.resources_offset, self.header.cau_offset);
         self.read(a, (b - a) as usize)
     }
 
-    pub fn index(&mut self) -> Result<([u8; 4], u32, Vec<IndexEntry>)> {
+    pub fn index(&self) -> Result<([u8; 4], u32, Vec<IndexEntry>)> {
         let o = self.header.index_offset;
         let b = self.read(o, (self.file_size - o) as usize)?;
         unpack_index(&b)
     }
 
-    pub fn cau_at(&mut self, offset: u64) -> Result<(Cau, usize)> {
+    pub fn cau_at(&self, offset: u64) -> Result<(Cau, usize)> {
         let head = self.read(offset, 8)?;
         let size = peek_cau_size(&head, 0)?;
         let b = self.read(offset, size)?;
@@ -193,16 +227,15 @@ impl LvfReader {
     }
 
     /// Walk the CAU region [start, end) sequentially (independent of the index), in large reads.
-    pub fn caus(&mut self, start: Option<u64>, end: Option<u64>) -> CauIter<'_> {
-        let start = start.unwrap_or(self.header.cau_offset);
-        let end = end.unwrap_or(self.header.index_offset);
-        CauIter { r: self, pos: start, end, buf: Vec::new(), buf_start: start, failed: false }
+    pub fn caus(&self, start: Option<u64>, end: Option<u64>) -> CauIter<&LvfReader> {
+        CauIter::new(self, start, end)
     }
 }
 
-/// Yields (offset, cau, size); an error ends the iteration.
-pub struct CauIter<'a> {
-    r: &'a mut LvfReader,
+/// Yields (offset, cau, size); an error ends the iteration. `R` is any handle to a reader
+/// (`&LvfReader`, `Arc<LvfReader>`, ...).
+pub struct CauIter<R: Deref<Target = LvfReader>> {
+    r: R,
     pos: u64,
     end: u64,
     buf: Vec<u8>,
@@ -210,8 +243,14 @@ pub struct CauIter<'a> {
     failed: bool,
 }
 
-impl CauIter<'_> {
+impl<R: Deref<Target = LvfReader>> CauIter<R> {
     const CHUNK: usize = 4 << 20;
+
+    pub fn new(r: R, start: Option<u64>, end: Option<u64>) -> CauIter<R> {
+        let start = start.unwrap_or(r.header.cau_offset);
+        let end = end.unwrap_or(r.header.index_offset);
+        CauIter { r, pos: start, end, buf: Vec::new(), buf_start: start, failed: false }
+    }
 
     /// Make [pos, pos+len) available in the buffer.
     fn ensure(&mut self, len: usize) -> Result<()> {
@@ -247,7 +286,7 @@ impl CauIter<'_> {
     }
 }
 
-impl Iterator for CauIter<'_> {
+impl<R: Deref<Target = LvfReader>> Iterator for CauIter<R> {
     type Item = Result<(u64, Cau, usize)>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.failed || self.pos >= self.end {

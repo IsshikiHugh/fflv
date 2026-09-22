@@ -115,7 +115,7 @@ fn is_number(v: &Value) -> bool {
     v.is_number()
 }
 
-fn check_meta(meta: &Value, rep: &mut Report, resources_size: u64, reader: &mut LvfReader) -> bool {
+fn check_meta(meta: &Value, rep: &mut Report, resources_size: u64, reader: &LvfReader) -> bool {
     let mut ok = true;
     let mut bad = |rep: &mut Report, msg: String, fatal: bool| {
         rep.error("META", msg, None);
@@ -403,7 +403,7 @@ pub fn validate(path: impl AsRef<Path>) -> Report {
 pub fn validate_opts(path: impl AsRef<Path>, check_bitstream: bool) -> Report {
     let path = path.as_ref();
     let mut rep = Report { path: path.display().to_string(), ..Default::default() };
-    let mut reader = match LvfReader::open(path) {
+    let reader = match LvfReader::open(path) {
         Ok(r) => r,
         Err(e) => {
             rep.error("HDR", format!("cannot read file header: {e}"), None);
@@ -411,7 +411,7 @@ pub fn validate_opts(path: impl AsRef<Path>, check_bitstream: bool) -> Report {
             return rep;
         }
     };
-    run(&mut reader, &mut rep, check_bitstream);
+    run(&reader, &mut rep, check_bitstream);
     rep
 }
 
@@ -426,7 +426,7 @@ struct LayerInfo {
     alpha_full: bool,
 }
 
-fn run(reader: &mut LvfReader, rep: &mut Report, check_bitstream: bool) {
+fn run(reader: &LvfReader, rep: &mut Report, check_bitstream: bool) {
     let h = reader.header.clone();
     rep.file_size = reader.file_size;
 
@@ -861,7 +861,7 @@ fn check_packet(rep: &mut Report, f: u32, li: usize, plane: &str, data: &[u8], f
     pk.key_frame()
 }
 
-fn check_index(reader: &mut LvfReader, rep: &mut Report, actual: &[(u64, u32, u8)], frame_count: u32) {
+fn check_index(reader: &LvfReader, rep: &mut Report, actual: &[(u64, u32, u8)], frame_count: u32) {
     let region = reader.file_size - reader.header.index_offset;
     let (magic, count, entries) = match reader.index() {
         Ok(x) => x,

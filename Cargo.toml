@@ -12,6 +12,13 @@ rust-version = "1.82"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
+[workspace.lints.clippy]
+# Encoder/edit entry points take many plain parameters on purpose; the clap command enum is
+# built once.
+too_many_arguments = "allow"
+type_complexity = "allow"
+large_enum_variant = "allow"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
