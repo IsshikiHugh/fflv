@@ -1,0 +1,17 @@
+[package]
+name = "vpx-sys"
+description = "Minimal FFI bindings to libvpx (VP9 encoder and decoder), generated with bindgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+links = "vpx"
+build = "build.rs"
+
+[build-dependencies]
+bindgen = "0.71"
+cc = "1"
+pkg-config = "0.3"
+
+[lints]
+workspace = true

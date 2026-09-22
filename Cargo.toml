@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lvf"]
+members = ["crates/lvf", "crates/vpx-sys"]
 
 [workspace.package]
 version = "0.2.0"
