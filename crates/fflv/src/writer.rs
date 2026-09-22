@@ -463,8 +463,8 @@ impl Writer {
             known.sort();
             return err(format!("unknown video layer(s) {unknown:?}{hint}; declared: {known:?}"));
         }
-        if self.out.is_none() {
-            self.begin()?;
+        if self.layers.is_empty() {
+            return err("declare at least one layer before writing");
         }
         let f = self.frames;
         // Check and convert every image before changing any state: a bad image leaves the writer as it was.
@@ -490,6 +490,9 @@ impl Writer {
                 let (i, p) = r?;
                 prepared.insert(i, p);
             }
+        }
+        if self.out.is_none() {
+            self.begin()?;
         }
         let gop = self.gop;
         for (i, l) in self.layers.iter_mut().enumerate() {

@@ -7,9 +7,7 @@ use crate::error::{Error, Result};
 use crate::image::ImageRef;
 use crate::pixel;
 
-pub fn even(n: u32) -> u32 {
-    n + (n & 1)
-}
+pub use lvf::meta::even;
 
 /// A frame converted to the layer's coded pictures, ready to encode.
 #[derive(Clone)]

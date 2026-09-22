@@ -71,6 +71,7 @@ impl Reader {
         if entries.len() != meta.frame_count as usize {
             return Err(Error::Decode("index does not match frame_count (run `fflv check`)".into()));
         }
+        check_layers(&meta)?;
         let offsets = entries.iter().map(|e| e.cau_offset).collect();
         let raps = entries.iter().enumerate().filter(|(_, e)| e.is_rap()).map(|(i, _)| i as u32).collect();
         Ok(Reader {
@@ -234,7 +235,8 @@ impl Reader {
     }
 
     pub fn frame(&self, index: u32, layers: Option<&[String]>, hide: &[String], transparent: bool) -> Result<Image> {
-        let mut it = self.frames(index, Some(index + 1), layers, hide, transparent)?;
+        let end = index.checked_add(1).ok_or_else(|| Error::Decode(format!("frame {index} is out of range")))?;
+        let mut it = self.frames(index, Some(end), layers, hide, transparent)?;
         it.next().ok_or_else(|| Error::Decode(format!("frame {index} was not decoded")))?.map(|(_, img)| img)
     }
 
@@ -255,6 +257,20 @@ impl Reader {
     }
 }
 
+/// What decoding relies on in the metadata (the validator checks much more).
+fn check_layers(meta: &Meta) -> Result<()> {
+    for l in meta.layers.iter().filter(|l| l.is_video()) {
+        let ((cw, ch), (w, h)) = (l.coded_size(), l.content_size());
+        if cw == 0 || ch == 0 || cw > 16384 || ch > 16384 || w == 0 || h == 0 || w > cw || h > ch {
+            return Err(Error::Decode(format!(
+                "layer {:?}: bad coded size {cw}x{ch} / content size {w}x{h} (run `fflv check`)",
+                l.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 struct LayerDecoder {
     index: usize,
     width: u32,
@@ -267,12 +283,24 @@ struct LayerDecoder {
 impl LayerDecoder {
     fn run(&mut self, color: &[u8], alpha: &[u8], convert: bool) -> Result<Option<LayerFrame>> {
         let (w, h, full) = (self.width, self.height, self.full);
+        let n = w as usize * h as usize;
+        // the metadata's content size must lie within what the stream decodes to
+        let fits = |f: &crate::codec::Frame, plane: &str| -> Result<()> {
+            if f.width < w || f.height < h {
+                return Err(Error::Decode(format!(
+                    "layer {} {plane}: decoded {}x{}, smaller than its content size {w}x{h} (run `fflv check`)",
+                    self.index, f.width, f.height
+                )));
+            }
+            Ok(())
+        };
         let (cdec, adec) = (&mut self.color, &mut self.alpha);
         let (rgb, a) = rayon::join(
             || -> Result<Option<Vec<u8>>> {
                 let f = cdec.decode(color)?;
+                fits(&f, "color")?;
                 Ok(convert.then(|| {
-                    let mut out = vec![0; (w * h * 3) as usize];
+                    let mut out = vec![0; n * 3];
                     frame_to_rgb(&f, w, h, &mut out);
                     out
                 }))
@@ -281,8 +309,9 @@ impl LayerDecoder {
                 match adec {
                     Some(d) if !alpha.is_empty() => {
                         let f = d.decode(alpha)?;
+                        fits(&f, "alpha")?;
                         Ok(convert.then(|| {
-                            let mut out = vec![0; (w * h) as usize];
+                            let mut out = vec![0; n];
                             frame_to_alpha(&f, w, h, full, &mut out);
                             out
                         }))

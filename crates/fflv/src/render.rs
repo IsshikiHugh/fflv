@@ -23,7 +23,8 @@ use crate::error::{Error, Result};
 use crate::image::{encode_png, Image};
 use crate::media::ffmpeg;
 
-pub type Progress<'a> = &'a mut dyn FnMut(u32, u32);
+/// Called with (frames done, frames in total) after each frame; an error stops the work.
+pub type Progress<'a> = &'a mut dyn FnMut(u32, u32) -> Result<()>;
 
 fn out_err<T>(msg: impl Into<String>) -> Result<T> {
     Err(Error::Output(msg.into()))
@@ -450,8 +451,9 @@ fn drain(
         match item.and_then(|(f, img)| sink.write(f, &img)) {
             Ok(()) => {
                 n += 1;
-                if let Some(p) = progress.as_mut() {
-                    p(n, total);
+                if let Some(Err(e)) = progress.as_mut().map(|p| p(n, total)) {
+                    result = Err(e);
+                    break;
                 }
             }
             Err(e) => {

@@ -93,18 +93,62 @@ pub struct ViewServer {
     media: PathBuf,
     media_name: String,
     quiet: bool,
+    /// Listening on a loopback address: only accept requests addressed to it (a page elsewhere
+    /// must not reach the file through DNS rebinding).
+    loopback_only: bool,
+}
+
+/// A started server (see [`ViewServer::start`]).
+pub struct Running {
+    server: Arc<Server>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Running {
+    /// Block until the server stops (it only stops through [`Running::stop`]).
+    pub fn wait(self) {
+        for w in self.workers {
+            let _ = w.join();
+        }
+    }
+
+    /// Stop the worker threads and wait for them.
+    pub fn stop(self) {
+        for _ in &self.workers {
+            self.server.unblock();
+        }
+        self.wait();
+    }
+}
+
+fn is_loopback_name(host: &str) -> bool {
+    let ip = host.trim_start_matches('[').trim_end_matches(']');
+    host == "localhost" || ip.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The host name of a Host header value (without the port).
+fn host_name(value: &str) -> &str {
+    let v = value.trim();
+    if v.starts_with('[') {
+        return v.find(']').map_or(v, |i| &v[..=i]);
+    }
+    v.split(':').next().unwrap_or(v)
 }
 
 /// `bytes=a-b` / `bytes=a-` / `bytes=-n` → [start, end) within `size`; Err(()) when unsatisfiable,
-/// None when malformed.
+/// None when malformed or not a single range (RFC 7233: then the whole file is sent).
 fn parse_range(value: &str, size: u64) -> Option<std::result::Result<(u64, u64), ()>> {
     let spec = value.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
     let (a, b) = spec.split_once('-')?;
     let num = |s: &str| if s.is_empty() { Some(None) } else { s.parse::<u64>().ok().map(Some) };
     let (a, b) = (num(a)?, num(b)?);
     let (start, end) = match (a, b) {
         (None, None) => return None,
-        (Some(a), b) => (a, b.map_or(size, |b| (b + 1).min(size))),
+        (Some(a), Some(b)) if b < a => return None,
+        (Some(a), b) => (a, b.map_or(size, |b| b.saturating_add(1).min(size))),
         (None, Some(n)) => (size.saturating_sub(n), size),
     };
     if start >= size || start >= end {
@@ -123,14 +167,16 @@ impl ViewServer {
         if !viewer_is_built() {
             return Err(Error::View("this fflv was built without the viewer (run `npm run build` in player/)".into()));
         }
-        let try_bind = |p: u16| Server::http((host, p)).ok();
-        let server = if port != 0 {
-            try_bind(port).ok_or_else(|| Error::View(format!("cannot listen on {host}:{port}")))?
-        } else {
-            (8765..8865).find_map(try_bind).or_else(|| try_bind(0)).ok_or_else(|| Error::View("no free port".into()))?
-        };
+        let last_error = std::cell::RefCell::new(String::new());
+        let try_bind = |p: u16| Server::http((host, p)).map_err(|e| *last_error.borrow_mut() = e.to_string()).ok();
+        let server = if port != 0 { try_bind(port) } else { (8765..8865).find_map(try_bind).or_else(|| try_bind(0)) };
+        let server = server.ok_or_else(|| {
+            let port = if port == 0 { "any port".to_string() } else { format!("port {port}") };
+            Error::View(format!("cannot listen on {host}, {port}: {}", last_error.borrow()))
+        })?;
         let media_name = media.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        Ok(ViewServer { server: Arc::new(server), media, media_name, quiet })
+        let loopback_only = is_loopback_name(&host.to_ascii_lowercase());
+        Ok(ViewServer { server: Arc::new(server), media, media_name, quiet, loopback_only })
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -143,13 +189,15 @@ impl ViewServer {
 
     pub fn url(&self) -> String {
         let a = self.addr();
-        format!("http://{}:{}/?src=/media/{}&watch=1", a.ip(), a.port(), percent_encode(&self.media_name))
+        format!("http://{a}/?src=/media/{}&watch=1", percent_encode(&self.media_name))
+        // [::1]:port for IPv6
     }
 
-    /// Serve until the process ends, on `threads` worker threads.
-    pub fn serve(self, threads: usize) {
+    /// Serve on `threads` worker threads, in the background.
+    pub fn start(self, threads: usize) -> Running {
+        let server = self.server.clone();
         let this = Arc::new(self);
-        let workers: Vec<_> = (0..threads.max(1))
+        let workers = (0..threads.max(1))
             .map(|_| {
                 let s = this.clone();
                 std::thread::spawn(move || {
@@ -159,14 +207,12 @@ impl ViewServer {
                 })
             })
             .collect();
-        for w in workers {
-            let _ = w.join();
-        }
+        Running { server, workers }
     }
 
-    /// Stop accepting requests (the serve() threads return).
-    pub fn unblock(&self) {
-        self.server.unblock();
+    /// Serve until the process ends.
+    pub fn serve(self, threads: usize) {
+        self.start(threads).wait();
     }
 
     fn handle(&self, req: Request) {
@@ -175,6 +221,13 @@ impl ViewServer {
         let head = *req.method() == Method::Head;
         if !self.quiet {
             eprintln!("{} {} {}", req.remote_addr().map_or("-".into(), |a| a.to_string()), req.method(), url);
+        }
+        if self.loopback_only {
+            let host = req.headers().iter().find(|h| h.field.equiv("Host")).map(|h| h.value.as_str().to_string());
+            if !host.as_deref().map(|h| host_name(h).to_ascii_lowercase()).is_some_and(|h| is_loopback_name(&h)) {
+                let _ = req.respond(Response::empty(403));
+                return;
+            }
         }
         if !matches!(req.method(), Method::Get | Method::Head) {
             let _ = req.respond(Response::empty(405).with_header(header("Allow", "GET, HEAD")));
@@ -215,14 +268,14 @@ impl ViewServer {
             req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string())
         };
         if let Some(want) = get("If-Match") {
-            if want.trim() != etag {
+            if want.trim() != "*" && want.trim() != etag {
                 return req.respond(media_headers(Response::empty(412), &etag));
             }
         }
         let (mut start, mut end, mut status) = (0, size, 200);
         if let Some(r) = get("Range") {
             match parse_range(&r, size) {
-                None => return req.respond(media_headers(Response::empty(416), &etag)),
+                None => {} // not a single valid range: the whole file
                 Some(Err(())) => {
                     return req.respond(
                         media_headers(Response::empty(416), &etag)
@@ -339,6 +392,9 @@ mod tests {
         assert_eq!(parse_range("bytes=95-200", 100), Some(Ok((95, 100))));
         assert_eq!(parse_range("bytes=100-", 100), Some(Err(())));
         assert_eq!(parse_range("bytes=-", 100), None);
+        assert_eq!(parse_range("bytes=5-3", 100), None);
+        assert_eq!(parse_range("bytes=0-1,5-6", 100), None);
+        assert_eq!(parse_range("bytes=0-18446744073709551615", 100), Some(Ok((0, 100))));
         assert_eq!(parse_range("items=0-1", 100), None);
     }
 
@@ -346,5 +402,14 @@ mod tests {
     fn percent_coding() {
         assert_eq!(percent_decode("a%20b%2F.lvd"), "a b/.lvd");
         assert_eq!(percent_encode("a b.lvd"), "a%20b.lvd");
+    }
+
+    #[test]
+    fn host_names() {
+        assert_eq!(host_name("127.0.0.1:8765"), "127.0.0.1");
+        assert_eq!(host_name("[::1]:80"), "[::1]");
+        assert_eq!(host_name("localhost"), "localhost");
+        assert!(!is_loopback_name(host_name("evil.example.com:8765")));
+        assert!(is_loopback_name(host_name("127.0.0.2:80")) && is_loopback_name(host_name("[::1]:80")));
     }
 }

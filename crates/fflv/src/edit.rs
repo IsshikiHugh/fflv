@@ -15,9 +15,7 @@
 use std::path::Path;
 
 use lvf::meta::{self, Layer, Rect, VideoLayerSpec, Z};
-use lvf::{
-    encode_meta, pts_us, publish, rewrite_meta_in_place, temp_path_for, Cau, LvfReader, Meta, Report, VideoEntry,
-};
+use lvf::{encode_meta, pts_us, publish, rewrite_meta_with, temp_path_for, Cau, LvfReader, Meta, Report, VideoEntry};
 use serde_json::Value;
 
 use crate::audio::{encode_audio, AudioTrack};
@@ -417,22 +415,45 @@ pub fn apply_edits(meta: &mut Meta, key: &str, fields: &[(String, Value)]) -> Re
 /// Change layer properties. Returns true when done in place (metadata only), false when the file
 /// had to be rewritten.
 pub fn set_layer(path: &Path, key: &str, fields: &[(String, Value)], output: Option<&Path>) -> Result<bool> {
-    let path = match output {
-        Some(out) if out != path => {
-            std::fs::copy(path, out)?;
-            out
-        }
-        _ => path,
+    let patch = |m: &mut Meta| -> Result<()> {
+        apply_edits(m, key, fields)?;
+        m.generator = Some(meta::GENERATOR.into());
+        Ok(())
     };
-    let (mut meta, _) = file_info(path)?;
-    apply_edits(&mut meta, key, fields)?;
-    meta.generator = Some(meta::GENERATOR.into());
-    if rewrite_meta_in_place(path, &encode_meta(&meta)?)? {
-        return Ok(true);
+    if let Some(out) = output.filter(|out| !same_file(path, out)) {
+        // A new file: written like every other edit (temporary file, validated, renamed).
+        remux(path, Some(out), &[], vec![], vec![], AudioEdit::Keep, Some(&patch), true)?;
+        return Ok(false);
+    }
+    // In place: the metadata is read, edited and rewritten through one open file.
+    let mut failure = None;
+    let in_place = rewrite_meta_with(path, |current| {
+        let edited = serde_json::from_slice::<Meta>(current)
+            .map_err(|e| Error::Format(format!("metadata does not match the LVF schema: {e}")))
+            .and_then(|mut m| patch(&mut m).map(|()| m))
+            .and_then(|m| Ok(encode_meta(&m)?));
+        edited.map_err(|e| {
+            let msg = e.to_string();
+            failure = Some(e);
+            lvf::Error::Value(msg)
+        })
+    });
+    match (in_place, failure) {
+        (_, Some(e)) => return Err(e),
+        (Err(e), None) => return Err(e.into()),
+        (Ok(true), None) => return Ok(true),
+        (Ok(false), None) => {}
     }
     // No room beside the current metadata: rewrite the file, applying the edits to the metadata
     // remux() builds (its still-resource offsets are recomputed for the rewritten resources).
-    let patch = |m: &mut Meta| apply_edits(m, key, fields);
     remux(path, None, &[], vec![], vec![], AudioEdit::Keep, Some(&patch), true)?;
     Ok(false)
+}
+
+/// Whether two paths name the same existing file (however they are spelled).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }

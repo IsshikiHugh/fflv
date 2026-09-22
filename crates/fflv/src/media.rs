@@ -122,6 +122,8 @@ pub fn open_video_source(path: &Path) -> Result<VideoSource> {
 pub struct RawFrames {
     child: Child,
     stdout: ChildStdout,
+    /// ffmpeg's stderr, drained on a thread (a full pipe would stall ffmpeg and with it the read)
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
     name: String,
     width: u32,
     height: u32,
@@ -133,11 +135,8 @@ pub struct RawFrames {
 impl RawFrames {
     fn fail(&mut self) -> Error {
         let _ = self.child.kill();
-        let mut err = Vec::new();
-        if let Some(mut e) = self.child.stderr.take() {
-            let _ = e.read_to_end(&mut err);
-        }
         let _ = self.child.wait();
+        let err = self.stderr.take().and_then(|t| t.join().ok()).unwrap_or_default();
         Error::Media(format!(
             "decoding {} stopped after {} of {} frames: {}",
             self.name,
@@ -191,7 +190,27 @@ pub fn raw_frames(src: &VideoSource, fps: Fps, w: u32, h: u32, count: u64, alpha
         .spawn()
         .map_err(|e| spawn_error(&cmd, &format!("decoding {name}"), e))?;
     let stdout = child.stdout.take().unwrap();
-    Ok(RawFrames { child, stdout, name, width: w, height: h, channels, count, done: 0 })
+    let stderr = child.stderr.take().map(|e| std::thread::spawn(move || tail_of(e, 64 << 10)));
+    Ok(RawFrames { child, stdout, stderr, name, width: w, height: h, channels, count, done: 0 })
+}
+
+/// Read a stream to its end, keeping the last `keep` bytes.
+fn tail_of(mut r: impl Read, keep: usize) -> Vec<u8> {
+    let mut tail = Vec::new();
+    let mut buf = [0u8; 8192];
+    while let Ok(n) = r.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        tail.extend_from_slice(&buf[..n]);
+        if tail.len() > 2 * keep {
+            tail.drain(..tail.len() - keep);
+        }
+    }
+    if tail.len() > keep {
+        tail.drain(..tail.len() - keep);
+    }
+    tail
 }
 
 /// PNG bytes for a still layer: a PNG file as is, any other image converted by FFmpeg.

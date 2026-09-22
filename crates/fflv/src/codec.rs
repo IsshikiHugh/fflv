@@ -108,10 +108,17 @@ pub struct Planar {
 
 impl Planar {
     pub fn new(format: PlaneFormat, width: u32, height: u32) -> Planar {
-        let p = Planar { format, width, height, data: Vec::new() };
-        let (cw, ch) = p.chroma_size();
-        let len = (width * height + 2 * cw * ch) as usize;
-        Planar { data: vec![0; len], ..p }
+        Planar { format, width, height, data: vec![0; Planar::byte_len(format, width, height)] }
+    }
+
+    /// Bytes of a `width`×`height` picture in `format`.
+    pub fn byte_len(format: PlaneFormat, width: u32, height: u32) -> usize {
+        let (w, h) = (width as usize, height as usize);
+        let (cw, ch) = match format {
+            PlaneFormat::I420 => (w.div_ceil(2), h.div_ceil(2)),
+            PlaneFormat::I444 => (w, h),
+        };
+        w * h + 2 * cw * ch
     }
 
     pub fn chroma_size(&self) -> (u32, u32) {
@@ -123,8 +130,8 @@ impl Planar {
 
     fn split(&self) -> (usize, usize) {
         let (cw, ch) = self.chroma_size();
-        let y = (self.width * self.height) as usize;
-        (y, y + (cw * ch) as usize)
+        let y = self.width as usize * self.height as usize;
+        (y, y + cw as usize * ch as usize)
     }
 
     pub fn planes(&self) -> [&[u8]; 3] {
@@ -151,6 +158,17 @@ pub enum Signal {
     Bt709Full,
     /// RGB (lossless color, 4:4:4 only)
     Rgb,
+}
+
+impl Signal {
+    /// (VPX_CS_*, VPX_CR_*)
+    fn vpx(self) -> (vpx::vpx_color_space_t, vpx::vpx_color_range_t) {
+        match self {
+            Signal::Bt709Limited => (vpx::VPX_CS_BT_709, vpx::VPX_CR_STUDIO_RANGE),
+            Signal::Bt709Full => (vpx::VPX_CS_BT_709, vpx::VPX_CR_FULL_RANGE),
+            Signal::Rgb => (vpx::VPX_CS_SRGB, vpx::VPX_CR_FULL_RANGE),
+        }
+    }
 }
 
 fn codec_message(ctx: *const vpx::vpx_codec_ctx_t, code: vpx::vpx_codec_err_t) -> String {
@@ -246,11 +264,7 @@ impl Encoder {
                 return Err(fail(format!("cannot start libvpx: {}", codec_message(&*ctx, rc))));
             }
             let mut enc = Encoder { ctx, width, height, format, signal, deadline, pts: 0, what: what.into() };
-            let (cs, range) = match signal {
-                Signal::Bt709Limited => (vpx::VPX_CS_BT_709, vpx::VPX_CR_STUDIO_RANGE),
-                Signal::Bt709Full => (vpx::VPX_CS_BT_709, vpx::VPX_CR_FULL_RANGE),
-                Signal::Rgb => (vpx::VPX_CS_SRGB, vpx::VPX_CR_FULL_RANGE),
-            };
+            let (cs, range) = signal.vpx();
             let mut controls = vec![
                 (vpx::VP8E_SET_CPUUSED, cpu_used),
                 (vpx::VP8E_SET_ENABLEAUTOALTREF, 0),
@@ -285,6 +299,18 @@ impl Encoder {
                 self.what, pic.width, pic.height, pic.format, self.width, self.height, self.format
             )));
         }
+        // libvpx reads the whole picture from `data`
+        let expected = Planar::byte_len(pic.format, pic.width, pic.height);
+        if pic.data.len() != expected {
+            return Err(Error::Encode(format!(
+                "{}: picture holds {} bytes, a {}x{} {:?} picture needs {expected}",
+                self.what,
+                pic.data.len(),
+                pic.width,
+                pic.height,
+                pic.format
+            )));
+        }
         let fmt = match self.format {
             PlaneFormat::I420 => vpx::VPX_IMG_FMT_I420,
             PlaneFormat::I444 => vpx::VPX_IMG_FMT_I444,
@@ -297,11 +323,7 @@ impl Encoder {
             if vpx::vpx_img_wrap(&mut img, fmt, self.width, self.height, 1, data).is_null() {
                 return Err(Error::Encode(format!("{}: vpx_img_wrap failed", self.what)));
             }
-            let (cs, range) = match self.signal {
-                Signal::Bt709Limited => (vpx::VPX_CS_BT_709, vpx::VPX_CR_STUDIO_RANGE),
-                Signal::Bt709Full => (vpx::VPX_CS_BT_709, vpx::VPX_CR_FULL_RANGE),
-                Signal::Rgb => (vpx::VPX_CS_SRGB, vpx::VPX_CR_FULL_RANGE),
-            };
+            let (cs, range) = self.signal.vpx();
             img.cs = cs;
             img.range = range;
             let flags = if key { vpx::VPX_EFLAG_FORCE_KF as vpx::vpx_enc_frame_flags_t } else { 0 };

@@ -70,7 +70,7 @@ impl<'a> Pixels<'a> {
 fn taps(dst: u32, src: u32, first: i64, origin: i64, count: usize) -> Vec<(usize, usize, f32)> {
     (0..count)
         .map(|k| {
-            let local = (first + k as i64 - origin) as f64;
+            let local = (first as i128 + k as i128 - origin as i128) as f64;
             if dst == src {
                 let i = local as usize;
                 return (i, i, 0.0);
@@ -107,7 +107,7 @@ impl Canvas {
     pub fn draw(&mut self, px: &Pixels, rect: Rect, blend: Blend, opacity: f32) {
         let (cw, ch) = (self.width as i64, self.height as i64);
         let (x0, y0) = (rect.x.max(0), rect.y.max(0));
-        let (x1, y1) = ((rect.x + rect.w as i64).min(cw), (rect.y + rect.h as i64).min(ch));
+        let (x1, y1) = (rect.x.saturating_add(rect.w as i64).min(cw), rect.y.saturating_add(rect.h as i64).min(ch));
         if x0 >= x1 || y0 >= y1 || px.width == 0 || px.height == 0 {
             return;
         }

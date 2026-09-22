@@ -23,6 +23,7 @@ use crate::codec::Speed;
 use crate::error::{Error, Result};
 use crate::image::Image;
 use crate::media::{open_video_source, raw_frames, still_png_from_file, RawFrames};
+use crate::render::Progress;
 use crate::writer::{LayerOptions, StillOptions, Writer, WriterOptions};
 
 fn err<T>(msg: impl Into<String>) -> Result<T> {
@@ -225,6 +226,12 @@ pub struct PackOptions {
 
 /// Build the project's file. Returns the validation report of the published file.
 pub fn pack(project: &Path, o: &PackOptions, log: Log) -> Result<Report> {
+    pack_with_progress(project, o, log, None)
+}
+
+/// [`pack`], reporting (frames encoded, frames in total) after each frame; a progress error stops
+/// the pack (the previous output stays).
+pub fn pack_with_progress(project: &Path, o: &PackOptions, log: Log, mut progress: Option<Progress>) -> Result<Report> {
     let t0 = Instant::now();
     let project = std::path::absolute(project)?;
     let proj = load_project(&project, o.output.as_deref())?;
@@ -340,6 +347,9 @@ pub fn pack(project: &Path, o: &PackOptions, log: Log) -> Result<Report> {
         let refs: Vec<(&str, crate::image::ImageRef)> =
             images.iter().map(|(i, img)| (proj.layers[*i].id.as_str(), img.view())).collect();
         w.write(&refs)?;
+        if let Some(p) = progress.as_mut() {
+            p(f + 1, proj.frame_count)?;
+        }
     }
     log(&format!("  done in {:.1} s; writing {} ...", t0.elapsed().as_secs_f64(), proj.output.display()));
     let rep = match w.close() {

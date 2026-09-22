@@ -17,8 +17,8 @@ pub fn compress_positions(values: &[u32], limit: usize) -> String {
         return "none".into();
     }
     if values.len() > 2 {
-        let step = values[1] - values[0];
-        if values.windows(2).all(|w| w[1] - w[0] == step) {
+        let step = values[1].wrapping_sub(values[0]);
+        if step > 0 && step < u32::MAX / 2 && values.windows(2).all(|w| w[1].wrapping_sub(w[0]) == step) {
             return format!("{}, {}, … {} (every {step})", values[0], values[1], values[values.len() - 1]);
         }
     }

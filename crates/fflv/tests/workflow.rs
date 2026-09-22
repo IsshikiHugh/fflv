@@ -454,6 +454,58 @@ fn rewrites_keep_stills_stored_out_of_layer_order() {
 }
 
 #[test]
+fn set_with_an_output_path() {
+    let path = copy_of("set_out");
+    let before = std::fs::read(&path).unwrap();
+    let d = path.parent().unwrap();
+    let z = |v: &str| vec![("z".to_string(), Value::from(v))];
+    // the same file, spelled differently: edited in place, never truncated
+    let same = d.join(".").join("t.lvd");
+    assert!(edit::set_layer(&path, "bg", &z("5"), Some(&same)).unwrap());
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), before.len() as u64);
+    assert_eq!(LvfReader::open(&path).unwrap().meta().unwrap().layers[0].z.0, 5.0);
+    // another file: written atomically and validated; the source is untouched
+    let src_now = std::fs::read(&path).unwrap();
+    let out = d.join("out.lvd");
+    assert!(!edit::set_layer(&path, "bg", &z("7"), Some(&out)).unwrap());
+    assert!(validate(&out).ok());
+    assert_eq!(LvfReader::open(&out).unwrap().meta().unwrap().layers[0].z.0, 7.0);
+    assert_eq!(std::fs::read(&path).unwrap(), src_now);
+    // a failing edit writes nothing
+    let bad = d.join("bad.lvd");
+    assert!(edit::set_layer(&path, "bg", &[("opacity".into(), Value::from("7"))], Some(&bad)).is_err());
+    assert!(edit::set_layer(&path, "nope", &z("1"), Some(&bad)).is_err());
+    assert!(!bad.exists());
+    let names: Vec<String> =
+        std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.iter().all(|n| !n.ends_with(".fflv-tmp")), "{names:?}");
+}
+
+/// Metadata that only the validator would catch must give errors when decoding, not panics.
+#[test]
+fn readers_reject_impossible_layer_sizes() {
+    let path = copy_of("sizes");
+    let mut m: Value = serde_json::from_slice(&LvfReader::open(&path).unwrap().meta_bytes().unwrap()).unwrap();
+    m["layers"][0]["content_size"] = serde_json::json!([65536, 65536]);
+    assert!(lvf::rewrite_meta_in_place(&path, &serde_json::to_vec(&m).unwrap()).unwrap());
+    let e = Reader::open(&path).err().expect("rejected");
+    assert!(e.to_string().contains("content size"), "{e}");
+    m["layers"][0]["content_size"] = serde_json::json!([640, 360]);
+    m["layers"][0]["coded_width"] = serde_json::json!(640);
+    assert!(lvf::rewrite_meta_in_place(&path, &serde_json::to_vec(&m).unwrap()).unwrap());
+    let r = Reader::open(&path).unwrap();
+    let mut frames = r.layer_frames("bg", Some(0), Some(1)).unwrap();
+    // content size equals the real stream: decodes
+    assert!(frames.next().unwrap().is_ok());
+    m["layers"][0]["content_size"] = serde_json::json!([1000, 360]);
+    m["layers"][0]["coded_width"] = serde_json::json!(1000);
+    assert!(lvf::rewrite_meta_in_place(&path, &serde_json::to_vec(&m).unwrap()).unwrap());
+    let r = Reader::open(&path).unwrap();
+    let e = r.layer_frames("bg", Some(0), Some(1)).unwrap().next().unwrap().unwrap_err();
+    assert!(e.to_string().contains("smaller than its content size"), "{e}");
+}
+
+#[test]
 fn corrupt_devtool_reports_every_variant() {
     let d = scratch("corrupt");
     let out = ok(&["corrupt", packed().path.to_str().unwrap(), "--out", d.to_str().unwrap(), "--check"]);

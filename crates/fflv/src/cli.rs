@@ -265,7 +265,7 @@ pub fn parse_range(spec: Option<&str>, fps: Fps, frame_count: u32) -> Result<(u3
     let (start, end) = match spec.split_once(':') {
         None => {
             let n = point(spec, fps)?;
-            (n, n + 1)
+            (n, n.saturating_add(1))
         }
         Some((a, b)) => {
             let start = if a.trim().is_empty() { 0 } else { point(a, fps)? };
@@ -300,7 +300,7 @@ impl Progress {
         Progress { what, t0: Instant::now(), last: -1.0, tty: std::io::stderr().is_terminal() }
     }
 
-    fn update(&mut self, done: u32, total: u32) {
+    fn update(&mut self, done: u32, total: u32) -> Result<()> {
         let now = self.t0.elapsed().as_secs_f64();
         if self.tty && (now - self.last > 0.2 || done == total) {
             self.last = now;
@@ -310,6 +310,7 @@ impl Progress {
                 eprintln!();
             }
         }
+        Ok(())
     }
 }
 
@@ -453,6 +454,8 @@ fn run(cli: Cli) -> Result<i32> {
             let in_place = edit::set_layer(&file, &layer, &kv, output.as_deref())?;
             let how = if in_place {
                 "metadata rewritten in place"
+            } else if output.is_some() {
+                "written"
             } else {
                 "file rewritten (metadata outgrew its reserved space)"
             };

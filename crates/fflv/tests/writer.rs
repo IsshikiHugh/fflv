@@ -57,7 +57,7 @@ fn layers_start_late_end_early_and_stay_sticky() {
     let (_, _, idx) = r.index().unwrap();
     let (cau, _) = r.cau_at(idx[5].cau_offset).unwrap();
     assert!(cau.entries[1].is_key() && !cau.is_rap());
-    assert!(!path.with_file_name(".out.lvd.fflv-tmp").exists());
+    assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1, "only out.lvd, no temporary file");
 }
 
 #[test]
@@ -81,6 +81,18 @@ fn declaration_and_image_errors() {
     w.write(&[]).unwrap();
     w.close().unwrap();
     assert!(validate(&path).ok());
+}
+
+#[test]
+fn a_rejected_first_image_changes_nothing() {
+    let path = tmp("first");
+    let mut w = Writer::create(&path, 16, 16, Fps::new(30, 1).unwrap(), opts(4)).unwrap();
+    w.add_layer("a", LayerOptions::default()).unwrap();
+    assert!(w.write(&[("a", gray(8, 8, 0).view())]).is_err());
+    // still before the first write: more layers may be declared
+    w.add_layer("b", LayerOptions::default()).unwrap();
+    w.write(&[("a", gray(16, 16, 1).view()), ("b", gray(16, 16, 2).view())]).unwrap();
+    assert!(w.close().unwrap().unwrap().ok());
 }
 
 #[test]
