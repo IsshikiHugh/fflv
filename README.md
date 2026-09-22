@@ -11,17 +11,31 @@ Synchronization does not depend on the player "doing its best". The format guara
 
 ## Installation
 
+The core (format, codecs, compositing, command line) is written in Rust; the Python package is a
+thin layer over it.
+
 Requirements:
-- Python ≥ 3.10.
-- The FFmpeg command line, built with libvpx-vp9 and libopus. It is only needed to import from video or audio files.
+- To build: Rust ≥ 1.83, libvpx (found with `pkg-config`) and libclang (for the bindings).
+  macOS: `brew install libvpx pkg-config` (libclang comes with the Xcode command line tools);
+  Debian/Ubuntu: `apt install libvpx-dev pkg-config libclang-dev`.
+- At run time, the FFmpeg command line (with libopus; libx264 / libvpx-vp9 for `.mp4` / `.webm`
+  output). It is only needed to import video, audio or non-PNG images, and to render videos or
+  JPEGs. Writing from numpy, decoding, compositing, PNG / `.npy` output, editing and viewing need
+  no FFmpeg.
 - Desktop Chrome or Edge, to watch files.
 
 ```bash
-conda activate lvf            # or any environment with Python >= 3.10
-pip install -e .              # installs the fflv command and Python package (depends on av, numpy)
+cargo install --path crates/fflv      # the fflv command: one binary, the player built in
+pip install .                          # or: the Python package (API + the same fflv command); needs numpy
+
+# development (conda env "lvf"):
+pip install maturin && maturin develop --release   # builds the extension into python/fflv/
+cargo build --release                               # target/release/fflv
 ```
 
-The bundled player (`fflv/viewer/`) is already built. Node is only needed after changing the player sources in `player/`: `cd player && npm install && npm run build`.
+The player (`crates/fflv/viewer/`) is already built and compiled into the binary. Node is only
+needed after changing the player sources in `player/`: `cd player && npm install && npm run build`,
+then rebuild fflv.
 
 ## Command line
 
@@ -62,7 +76,7 @@ fflv pack    project.json -o out.lvd                            # build a file f
 - `.npy`: a numpy array.
 - `--transparent`: output with alpha (PNG, `.mov`, `.webm`, `.mkv`).
 
-**`render` decodes only the selected layers**; the data of every other layer is skipped, so switching between layer combinations costs nothing extra.
+**`render` decodes only the selected layers**; the data of every other layer is skipped, so switching between layer combinations costs nothing extra. Video outputs are tagged BT.709.
 
 ## Interactive player (`fflv view`)
 
@@ -119,32 +133,46 @@ fflv.render("debug.lvd", "clip.mp4", layers=["frame", "pred"], start=0, end=300)
 - `speed` (`fast` / `balanced` / `best`).
 - `lossless=True`: pixel values are kept bit for bit. Meant for masks and numeric debug images; files get noticeably larger.
 
+## Speed
+
+On an M-series Mac, the 20-second 1280×720 test file (7 layers, 11 VP9 streams, 600 frames):
+
+| | |
+|---|---|
+| decode all layers | 1.1 s |
+| decode + composite every frame | 2.0 s (the earlier Python implementation: 18 s) |
+| one frame at a random-access point, one layer | 1 ms |
+| validate | a few ms |
+| `fflv testsrc` (render the sources and pack them) | 11 s |
+
+Encoding and decoding run layer-parallel and plane-parallel; the Python API releases the GIL while
+they run.
+
 ## Repository layout
 
 ```
-fflv/                Python package (command line + API)
-  format/            binary structures, reading/writing, VP9 header parsing, validator (invariants I1–I10)
-  encode/            VP9 encoding (numpy in process / FFmpeg), Opus audio, Writer
-  decode.py          Reader: decoding selected layers, compositing
-  render.py          render / extract outputs
-  edit.py            add / rm / set (remux, no re-encoding)
-  view.py            local server for fflv view
-  project.py         pack (from a project file)
-  devtools/          testsrc (test material), corrupt (broken files)
-  viewer/            the built web player
+LVF_SPEC.md          the format
+crates/lvf/          the container: binary structures, reader/writer, VP9 header parsing,
+                     metadata, validator (invariants I1–I10), copy-on-write edits, publishing
+crates/vpx-sys/      libvpx bindings (bindgen)
+crates/fflv/         codec (libvpx), pixel conversion, compositing, Writer, Reader, edit, pack,
+                     render, view server, dev tools, the fflv command; viewer/ is the built player
+crates/fflv-python/  the Python extension (PyO3)
+python/fflv/         the Python package on top of it
 player/              web player sources (TypeScript + Vite, WebCodecs + WebGL2, no framework)
-tests/               pytest
+tests/               pytest (Python API, command line, view server)
 ```
 
 ## Tests
 
 ```bash
-conda activate lvf
-python -m pytest                          # Python: format, Writer, editing, decoding, render, view server, CLI
+cargo test                                # Rust: format, codec, Writer, Reader, edits, pack, render, CLI
+conda activate lvf && maturin develop --release
+python -m pytest                          # Python API, command line, view server
 fflv testsrc                              # generate test_assets/ and test_assets/test.lvd
 fflv corrupt test_assets/test.lvd --check # all 13 kinds of broken files must be reported precisely
-cd player && npm test && npm run build
-npm run e2e                               # end-to-end in Chrome for Testing + Edge (run where fflv is installed)
+cd player && npm test && npm run build && cargo build --release
+npm run e2e                               # end-to-end in Chrome for Testing + Edge (uses target/release/fflv)
 LVF_SOAK_SECONDS=600 npx playwright test -g "long playback" --project=chromium   # 10-minute playback
 ```
 
@@ -154,8 +182,8 @@ LVF_SOAK_SECONDS=600 npx playwright test -g "long playback" --project=chromium  
 
 | Acceptance item (spec §11.2) | Test |
 |---|---|
-| 1 Pack + all invariants pass | `tests/test_pack.py`; `fflv pack` validates automatically |
-| 2 Broken files are reported precisely | `tests/test_bad_files.py`, `fflv corrupt --check` |
+| 1 Pack + all invariants pass | `crates/fflv/tests/workflow.rs`, `tests/test_pack.py`; `fflv pack` validates automatically |
+| 2 Broken files are reported precisely | `crates/lvf/tests/validate.rs`, `fflv corrupt --check` |
 | 3 Continuous playback, red line centred in the white line | `player/e2e/acceptance.spec.ts` |
 | 4 Frame numbers agree after toggling / scrubbing / stepping | same (45 random operations) |
 | 5 No desync at 6× CPU slowdown, P6 failures = 0 | same (plus slow-storage and busy-main-thread stress tests) |
