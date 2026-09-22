@@ -13,3 +13,5 @@ player/dist/
 # note: fflv/viewer/ (the built player) IS kept, so `pip install` works without Node
 player/test-results/
 player/playwright-report/
+# rust
+/target/
