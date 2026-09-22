@@ -1,0 +1,21 @@
+[package]
+name = "fflv"
+description = "Pack, edit, decode, render and view LVF layered video files (.lvd)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "fflv"
+path = "src/lib.rs"
+
+[dependencies]
+lvf = { path = "../lvf" }
+png = "0.17"
+rayon = "1.10"
+serde_json.workspace = true
+vpx-sys = { path = "../vpx-sys" }
+
+[lints]
+workspace = true
