@@ -411,6 +411,48 @@ fn command_line_workflow() {
     assert_eq!(fflv(&["render", fs, "-f", "999", "-o", d.join("x.png").to_str().unwrap()]).status.code(), Some(2));
 }
 
+/// A (third-party) file whose resource region stores stills in another order than the layers:
+/// the rewrite fallback of set_layer must keep every still with its own image.
+#[test]
+fn rewrites_keep_stills_stored_out_of_layer_order() {
+    use fflv::image::encode_png;
+    use fflv::{LayerOptions, StillOptions, Writer, WriterOptions};
+    use lvf::{Fps, LvfWriter, Rect};
+
+    let d = scratch("stills");
+    let src = d.join("canon.lvd");
+    // two colors whose PNGs have the same length (a swap would then go unnoticed by validation)
+    let red = encode_png(Image::filled(8, 8, &[30, 20, 10]).view(), false).unwrap();
+    let blue = encode_png(Image::filled(8, 8, &[10, 20, 30]).view(), false).unwrap();
+    assert_eq!(red.len(), blue.len());
+    let mut w = Writer::create(&src, 16, 8, Fps::new(30, 1).unwrap(), WriterOptions::default()).unwrap();
+    w.add_layer("v", LayerOptions { rect: Some(Rect { x: 0, y: 0, w: 2, h: 2 }), ..Default::default() }).unwrap();
+    let at = |x| Some(Rect { x, y: 0, w: 8, h: 8 });
+    w.add_still("red", red.clone(), StillOptions { rect: at(0), ..Default::default() }).unwrap();
+    w.add_still("blue", blue.clone(), StillOptions { rect: at(8), ..Default::default() }).unwrap();
+    w.write(&[("v", Image::filled(2, 2, &[0, 0, 0]).view())]).unwrap();
+    w.close().unwrap();
+
+    let r = LvfReader::open(&src).unwrap();
+    let mut meta = r.meta().unwrap();
+    for l in meta.layers.iter_mut().filter(|l| l.resource.is_some()) {
+        l.resource.as_mut().unwrap().offset = if l.id == "blue" { 0 } else { blue.len() as u64 };
+    }
+    let odd = d.join("odd.lvd");
+    let mut w = LvfWriter::create(&odd).unwrap();
+    // store blue first, red second, with no room beside the metadata: set_layer must rewrite
+    w.begin(&lvf::encode_meta(&meta).unwrap(), &[blue.as_slice(), red.as_slice()].concat(), Some(0)).unwrap();
+    for c in r.caus(None, None) {
+        w.write_cau(&c.unwrap().1).unwrap();
+    }
+    w.finish(None, None).unwrap();
+    assert!(validate(&odd).ok());
+    assert!(!edit::set_layer(&odd, "v", &[("name".into(), Value::from("renamed"))], None).unwrap());
+    let img = Reader::open(&odd).unwrap().frame(0, Some(&["red".into(), "blue".into()]), &[], false).unwrap();
+    let px = |x: u32| img.data[((4 * 16 + x) * 3) as usize..][..3].to_vec();
+    assert_eq!((px(4), px(12)), (vec![30, 20, 10], vec![10, 20, 30]));
+}
+
 #[test]
 fn corrupt_devtool_reports_every_variant() {
     let d = scratch("corrupt");

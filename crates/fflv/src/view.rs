@@ -193,7 +193,8 @@ impl ViewServer {
                 Some(f) => req.respond(
                     Response::from_data(f.contents())
                         .with_header(header("Content-Type", content_type(&rel)))
-                        .with_header(header("Cache-Control", "no-store")),
+                        .with_header(header("Cache-Control", "no-store"))
+                        .with_chunked_threshold(usize::MAX),
                 ),
                 None => req.respond(Self::not_found()),
             }
@@ -242,10 +243,13 @@ impl ViewServer {
     }
 }
 
+/// Media responses always carry a Content-Length (tiny_http would switch to chunked transfer for
+/// large bodies, and HEAD responses would lose the file size the player reads from them).
 fn media_headers<R: Read>(r: Response<R>, etag: &str) -> Response<R> {
     r.with_header(header("ETag", etag))
         .with_header(header("Accept-Ranges", "bytes"))
         .with_header(header("Cache-Control", "no-store"))
+        .with_chunked_threshold(usize::MAX)
 }
 
 /// Open `url` in Chrome / Edge (WebCodecs); returns what was used.

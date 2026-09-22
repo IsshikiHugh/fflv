@@ -38,7 +38,8 @@ impl std::error::Error for PublishError {}
 pub fn publish(tmp: &Path, dst: &Path, check: bool) -> Result<Option<Report>, PublishError> {
     let mut rep = None;
     if check {
-        let r = validate(tmp);
+        let mut r = validate(tmp);
+        r.path = dst.display().to_string(); // the file the report is about, once published
         if !r.ok() {
             let _ = fs::remove_file(tmp);
             return Err(PublishError::Invalid { dst: dst.display().to_string(), report: Box::new(r) });

@@ -382,3 +382,23 @@ fn unknown_metadata_fields_survive_a_roundtrip() {
     let m: Meta = serde_json::from_value(v.clone()).unwrap();
     assert_eq!(serde_json::to_value(&m).unwrap(), v);
 }
+
+#[test]
+fn an_invalid_result_never_replaces_the_destination() {
+    let dst = tmp("published.lvd");
+    std::fs::write(&dst, b"previous version").unwrap();
+    let part = temp_path_for(&dst);
+    std::fs::write(&part, [b"LVF1".as_slice(), &[0u8; 100]].concat()).unwrap();
+    match publish(&part, &dst, true) {
+        Err(PublishError::Invalid { report, .. }) => assert!(!report.ok()),
+        other => panic!("expected an invalid result, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&dst).unwrap(), b"previous version");
+    assert!(!part.exists());
+    // a valid file is published, and its report names the destination
+    let good = build("publish_src.lvd", |_| {}, |_| {});
+    std::fs::copy(&good, &part).unwrap();
+    let rep = publish(&part, &dst, true).unwrap().unwrap();
+    assert!(rep.ok() && rep.path == dst.display().to_string());
+    assert_eq!(std::fs::read(&dst).unwrap(), std::fs::read(&good).unwrap());
+}

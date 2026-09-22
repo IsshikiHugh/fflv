@@ -182,6 +182,9 @@ pub struct Writer {
     broken: Option<String>,
     pool: rayon::ThreadPool,
     pub report: Option<Report>,
+    /// Test hook: the encoder of this layer fails.
+    #[cfg(test)]
+    fail_encode: Option<String>,
 }
 
 fn err<T>(msg: impl Into<String>) -> Result<T> {
@@ -226,6 +229,8 @@ impl Writer {
             broken: None,
             pool,
             report: None,
+            #[cfg(test)]
+            fail_encode: None,
         })
     }
 
@@ -505,6 +510,8 @@ impl Writer {
     }
 
     fn encode_and_write(&mut self, f: u32, gop: u32) -> Result<u32> {
+        #[cfg(test)]
+        let fail = self.fail_encode.clone();
         let mut jobs: Vec<(usize, &mut VideoLayer, bool)> = self
             .layers
             .iter_mut()
@@ -520,6 +527,10 @@ impl Writer {
         let encoded: Vec<Result<(usize, bool, Vec<u8>, Vec<u8>)>> = self.pool.install(|| {
             jobs.par_iter_mut()
                 .map(|(i, v, key)| {
+                    #[cfg(test)]
+                    if fail.as_deref() == Some(v.id.as_str()) {
+                        return Err(Error::Encode("encoder crashed".into()));
+                    }
                     let p = v.last.as_ref().expect("an active layer has an image");
                     let (c, a) = v.encoder.encode_prepared(p, *key)?;
                     Ok((*i, *key, c, a))
@@ -642,5 +653,40 @@ impl Drop for Writer {
         if !self.closed {
             self.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image::Image;
+
+    /// After an encoder error mid-frame the other layers' encoders are a frame ahead of the file;
+    /// continuing would produce a file that validates but decodes wrongly.
+    #[test]
+    fn a_failed_encode_makes_the_writer_refuse_to_continue() {
+        let dir = std::env::temp_dir().join(format!("fflv-writer-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("broken.lvd");
+        let opts = WriterOptions { gop: Some(4), speed: Speed::Fast, ..Default::default() };
+        let mut w = Writer::create(&path, 32, 32, Fps::new(30, 1).unwrap(), opts).unwrap();
+        let lossless = LayerOptions { lossless: true, ..Default::default() };
+        w.add_layer("a", lossless.clone()).unwrap();
+        w.add_layer("b", lossless).unwrap();
+        let img = |v: u8| Image::filled(32, 32, &[v, v, v]);
+        for f in 0..3 {
+            let (a, b) = (img(f), img(f));
+            w.write(&[("a", a.view()), ("b", b.view())]).unwrap();
+        }
+        w.fail_encode = Some("b".into());
+        let (a, b) = (img(3), img(3));
+        assert!(w.write(&[("a", a.view()), ("b", b.view())]).unwrap_err().to_string().contains("encoder crashed"));
+        w.fail_encode = None;
+        let e = w.write(&[("a", a.view()), ("b", b.view())]).unwrap_err();
+        assert!(e.to_string().contains("failed while encoding"), "{e}");
+        let e = w.close().unwrap_err();
+        assert!(e.to_string().contains("not written"), "{e}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 }
