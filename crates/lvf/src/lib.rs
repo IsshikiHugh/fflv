@@ -15,7 +15,9 @@ pub mod validate;
 pub mod vp9;
 
 pub use binary::{AudioPacket, Cau, FileHeader, IndexEntry, VideoEntry};
-pub use container::{encode_meta, meta_capacity_for, rewrite_meta_in_place, temp_path_for, LvfReader, LvfWriter};
+pub use container::{
+    encode_meta, meta_capacity_for, rewrite_meta_in_place, rewrite_meta_with, temp_path_for, LvfReader, LvfWriter,
+};
 pub use error::{Error, Result};
 pub use meta::{Kind, Layer, Meta, MetaError, Rect, Z};
 pub use output::{publish, PublishError};

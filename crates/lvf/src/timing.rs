@@ -85,7 +85,7 @@ pub fn parse_decimal(s: &str) -> Option<(i128, i128)> {
     }
     let digits = format!("{int}{frac}");
     let mut num: i128 = digits.parse().ok()?;
-    let mut scale = frac.len() as i32 - exp;
+    let mut scale = (frac.len() as i32).checked_sub(exp)?;
     let mut den: i128 = 1;
     while scale > 0 {
         den = den.checked_mul(10)?;
@@ -102,9 +102,11 @@ pub fn parse_decimal(s: &str) -> Option<(i128, i128)> {
 /// (0.1 means exactly 1/10, so `3.0` at 30 fps is exactly frame 90).
 pub fn seconds_to_frame(seconds: &str, fps: Fps) -> Result<i64, String> {
     let (n, d) = parse_decimal(seconds).ok_or_else(|| format!("cannot parse seconds {seconds:?}"))?;
-    let num = n * fps.num as i128;
-    let den = d * fps.den as i128;
-    Ok(round_half_up(num, den))
+    let too_big = || format!("seconds {seconds:?} is out of range");
+    let num = n.checked_mul(fps.num as i128).and_then(|v| v.checked_mul(2)).ok_or_else(too_big)?;
+    let den = d.checked_mul(fps.den as i128).and_then(|v| v.checked_mul(2)).ok_or_else(too_big)?;
+    let frame = (num + den / 2).div_euclid(den); // = round_half_up(num / 2, den / 2)
+    i64::try_from(frame).map_err(|_| too_big())
 }
 
 /// round(num / den), halves rounded towards +infinity; den > 0.

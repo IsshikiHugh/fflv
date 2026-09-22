@@ -46,6 +46,16 @@ pub fn publish(tmp: &Path, dst: &Path, check: bool) -> Result<Option<Report>, Pu
         }
         rep = Some(r);
     }
-    fs::rename(tmp, dst).map_err(PublishError::Io)?;
+    if let Err(e) = fs::rename(tmp, dst) {
+        let _ = fs::remove_file(tmp);
+        return Err(PublishError::Io(e));
+    }
+    // make the rename itself durable (the file's own data was synced by its writer)
+    #[cfg(unix)]
+    if let Some(dir) = dst.parent().map(|d| if d.as_os_str().is_empty() { Path::new(".") } else { d }) {
+        if let Ok(d) = fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
     Ok(rep)
 }

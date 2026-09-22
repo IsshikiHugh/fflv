@@ -111,7 +111,7 @@ impl LvfWriter {
         }
         f.seek(SeekFrom::Start(0))?;
         f.write_all(&self.header.pack())?;
-        f.flush()?;
+        f.sync_all()?; // durable before it is renamed into place (spec B.11)
         Ok(())
     }
 
@@ -119,6 +119,15 @@ impl LvfWriter {
     pub fn abort(mut self) {
         self.f.take();
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for LvfWriter {
+    /// A writer dropped before finish() (an error or a panic on the way) removes its file.
+    fn drop(&mut self) {
+        if self.f.take().is_some() {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -180,7 +189,7 @@ impl LvfReader {
     }
 
     pub fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        if offset + len as u64 > self.file_size {
+        if offset.checked_add(len as u64).is_none_or(|end| end > self.file_size) {
             return format_err(format!("short read: wanted {len} bytes at {offset}, file has {}", self.file_size));
         }
         let mut buf = vec![0u8; len];
@@ -204,18 +213,26 @@ impl LvfReader {
     }
 
     pub fn resource(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let o = self.header.resources_offset + offset;
-        self.read(o, len as usize)
+        match (self.header.resources_offset.checked_add(offset), usize::try_from(len)) {
+            (Some(o), Ok(len)) => self.read(o, len),
+            _ => format_err(format!("resource at {offset} ({len} bytes) is outside the file")),
+        }
     }
 
     pub fn resources(&self) -> Result<Vec<u8>> {
         let (a, b) = (self.header.resources_offset, self.header.cau_offset);
-        self.read(a, (b - a) as usize)
+        match b.checked_sub(a) {
+            Some(n) => self.read(a, n as usize),
+            None => format_err(format!("cau_offset {b} is before resources_offset {a}")),
+        }
     }
 
     pub fn index(&self) -> Result<([u8; 4], u32, Vec<IndexEntry>)> {
         let o = self.header.index_offset;
-        let b = self.read(o, (self.file_size - o) as usize)?;
+        let Some(n) = self.file_size.checked_sub(o) else {
+            return format_err(format!("index_offset {o} is past the end of the file ({} bytes)", self.file_size));
+        };
+        let b = self.read(o, n as usize)?;
         unpack_index(&b)
     }
 
@@ -322,16 +339,44 @@ pub fn rewrite_meta_in_place(path: impl AsRef<Path>, data: &[u8]) -> Result<bool
     rewrite_meta_in_place_hooked(path, data, &mut |_| Ok(()))
 }
 
+/// Like [`rewrite_meta_in_place`], with the new metadata computed from the current one, read
+/// through the same open file that is then rewritten (so a file renamed over `path` in between
+/// cannot get another file's metadata).
+pub fn rewrite_meta_with(path: impl AsRef<Path>, edit: impl FnOnce(&[u8]) -> Result<Vec<u8>>) -> Result<bool> {
+    let mut edit = Some(edit);
+    rewrite(path, &mut |current| (edit.take().expect("called once"))(current), &mut |_| Ok(()))
+}
+
 /// Test hook: `before_switch` runs after the new copy is synced, before the header switches.
 pub fn rewrite_meta_in_place_hooked(
     path: impl AsRef<Path>,
     data: &[u8],
     before_switch: &mut dyn FnMut(&mut File) -> Result<()>,
 ) -> Result<bool> {
+    rewrite(path, &mut |_| Ok(data.to_vec()), before_switch)
+}
+
+type MetaEdit<'a> = &'a mut dyn FnMut(&[u8]) -> Result<Vec<u8>>;
+
+fn rewrite(
+    path: impl AsRef<Path>,
+    edit: MetaEdit,
+    before_switch: &mut dyn FnMut(&mut File) -> Result<()>,
+) -> Result<bool> {
     let mut f = OpenOptions::new().read(true).write(true).open(path)?;
     let mut hb = [0u8; HEADER_SIZE];
     f.read_exact(&mut hb)?;
     let mut header = FileHeader::unpack(&hb)?;
+    let size = f.metadata()?.len();
+    let meta_end = header.meta_offset.checked_add(header.meta_length as u64);
+    if header.resources_offset > size || meta_end.is_none_or(|e| e > header.resources_offset) {
+        return format_err("the header's metadata region is outside the file");
+    }
+    let mut current = vec![0u8; header.meta_length as usize];
+    f.seek(SeekFrom::Start(header.meta_offset))?;
+    f.read_exact(&mut current)?;
+    let data = edit(&current)?;
+    let data = data.as_slice();
     let region = (HEADER_SIZE as u64, header.resources_offset);
     let current = (header.meta_offset, header.meta_offset + header.meta_length as u64);
     let Some(offset) = free_slot(region, current, data.len() as u64) else { return Ok(false) };
@@ -350,9 +395,14 @@ pub fn rewrite_meta_in_place_hooked(
 // ------------------------------------------------------------------------------------------------
 // Publishing (spec B.11)
 // ------------------------------------------------------------------------------------------------
-/// Hidden sibling of `dst` (same directory, so the final rename is atomic).
+/// A hidden sibling of `dst` (same directory, so the final rename is atomic), unique per call,
+/// so concurrent writers to one destination never share a temporary file.
 pub fn temp_path_for(dst: impl AsRef<Path>) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let dst = dst.as_ref();
     let name = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "out.lvd".into());
-    dst.with_file_name(format!(".{name}.fflv-tmp"))
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    dst.with_file_name(format!(".{name}.{}-{n}-{nanos:x}.fflv-tmp", std::process::id()))
 }

@@ -1,5 +1,6 @@
 //! The metadata JSON (spec section 4 + Appendix B) as typed structures, plus the rules for building
-//! and editing it. Unknown fields are kept (`extra`), so readers and editors preserve them.
+//! and editing it. Unknown fields of the file, its layers and its audio are kept (`extra`), so
+//! readers and editors preserve them (unknown fields inside canvas, fps, rect and resource are not).
 //!
 //! The validator works on the raw JSON value (so it can report every problem); code that has a
 //! validated file uses these types.
@@ -64,7 +65,7 @@ pub struct Rect {
     pub h: u32,
 }
 
-/// Drawing order. Written as a JSON integer when integral (like the Python writer), else a float.
+/// Drawing order. Written as a JSON integer when integral ("z": 3, not 3.0), else a float.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Z(pub f64);
 

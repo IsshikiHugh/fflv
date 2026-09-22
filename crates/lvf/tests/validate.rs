@@ -402,3 +402,73 @@ fn an_invalid_result_never_replaces_the_destination() {
     assert!(rep.ok() && rep.path == dst.display().to_string());
     assert_eq!(std::fs::read(&dst).unwrap(), std::fs::read(&good).unwrap());
 }
+
+#[test]
+fn temporary_files_are_unique_per_writer() {
+    let a = temp_path_for("x/out.lvd");
+    let b = temp_path_for("x/out.lvd");
+    assert_ne!(a, b);
+    let name = a.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.starts_with(".out.lvd.") && name.ends_with(".fflv-tmp"), "{name}");
+}
+
+/// Offsets and numbers from a hostile file must give errors, never panics or false VALIDs.
+#[test]
+fn out_of_range_offsets_and_numbers() {
+    let good = build("range_src.lvd", |_| {}, |_| {});
+    let data = std::fs::read(&good).unwrap();
+
+    let mut h = FileHeader::unpack(&data[..HEADER_SIZE]).unwrap();
+    h.index_offset = 1 << 52;
+    let path = tmp("far_index.lvd");
+    std::fs::write(&path, [h.pack().as_slice(), &data[HEADER_SIZE..]].concat()).unwrap();
+    assert!(LvfReader::open(&path).unwrap().index().is_err());
+    assert!(LvfReader::open(&path).unwrap().read(u64::MAX - 3, 8).is_err());
+    let rep = validate(&path);
+    assert!(!rep.ok() && codes(&rep).contains(&"HDR".to_string()));
+
+    let edit = |name: &str, f: &dyn Fn(&mut serde_json::Value)| {
+        let path = tmp(name);
+        std::fs::copy(&good, &path).unwrap();
+        let mut m: serde_json::Value =
+            serde_json::from_slice(&LvfReader::open(&path).unwrap().meta_bytes().unwrap()).unwrap();
+        f(&mut m);
+        assert!(rewrite_meta_in_place(&path, &serde_json::to_vec(&m).unwrap()).unwrap());
+        validate(&path)
+    };
+    let rep = edit("big_frame_count.lvd", &|m| m["frame_count"] = serde_json::json!(4294967416u64));
+    assert!(!rep.ok() && rep.fatal, "a frame count past u32 must not validate");
+    let rep = edit("big_fps.lvd", &|m| m["fps"]["num"] = serde_json::json!(5000000000u64));
+    assert!(!rep.ok() && rep.fatal);
+    let rep = edit("big_end.lvd", &|m| m["layers"][0]["end_frame"] = serde_json::json!(1u64 << 40));
+    assert!(!rep.ok());
+    // whatever the readers' schema rejects is invalid, so `check` and `render` agree
+    let cases: [(&str, &dyn Fn(&mut serde_json::Value)); 4] = [
+        ("generator.lvd", &|m| m["generator"] = serde_json::json!(5)),
+        ("pre_skip.lvd", &|m| m["audio"]["pre_skip"] = serde_json::json!(-1)),
+        ("canvas.lvd", &|m| m["canvas"]["width"] = serde_json::json!(4294967616u64)),
+        ("rect.lvd", &|m| m["layers"][0]["rect"]["x"] = serde_json::json!(1u64 << 63)),
+    ];
+    for (name, f) in cases {
+        let rep = edit(name, f);
+        assert!(!rep.ok() && rep.fatal, "{name}");
+        assert!(LvfReader::open(tmp(name)).unwrap().meta().is_err(), "{name}");
+    }
+}
+
+#[test]
+fn metadata_edits_read_and_write_through_one_handle() {
+    let path = build("edit_with.lvd", |_| {}, |_| {});
+    let edited = lvf::rewrite_meta_with(&path, |current| {
+        let mut m: serde_json::Value = serde_json::from_slice(current).unwrap();
+        m["layers"][0]["name"] = serde_json::json!("renamed");
+        Ok(serde_json::to_vec(&m).unwrap())
+    })
+    .unwrap();
+    assert!(edited && validate(&path).ok());
+    assert_eq!(LvfReader::open(&path).unwrap().meta().unwrap().layers[0].name, "renamed");
+    // an error from the edit leaves the file as it was
+    let before = std::fs::read(&path).unwrap();
+    assert!(lvf::rewrite_meta_with(&path, |_| Err(Error::Value("no".into()))).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}

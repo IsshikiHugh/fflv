@@ -449,7 +449,7 @@ fn run(reader: &LvfReader, rep: &mut Report, check_bitstream: bool) {
         rep.error("HDR", format!("meta_offset {} overlaps the header", h.meta_offset), None);
         rep.fatal = true;
     }
-    if h.meta_offset + h.meta_length as u64 > h.resources_offset {
+    if h.meta_offset.saturating_add(h.meta_length as u64) > h.resources_offset {
         rep.error(
             "HDR",
             format!(
@@ -515,12 +515,24 @@ fn run(reader: &LvfReader, rep: &mut Report, check_bitstream: bool) {
         return;
     }
     rep.meta = Some(meta.clone());
-    if !check_meta(&meta, rep, h.cau_offset - h.resources_offset, reader) {
+    if !check_meta(&meta, rep, h.cau_offset.saturating_sub(h.resources_offset), reader) {
         rep.fatal = true;
         return;
     }
-
-    let fps = Fps::new(meta["fps"]["num"].as_u64().unwrap(), meta["fps"]["den"].as_u64().unwrap()).unwrap();
+    // The readers' own schema (types and ranges): what it rejects cannot be read, so it is fatal.
+    if let Err(e) = serde_json::from_value::<crate::meta::Meta>(meta.clone()) {
+        rep.error("META", format!("metadata does not match the LVF schema: {e}"), None);
+        rep.fatal = true;
+        return;
+    }
+    let fps = match Fps::new(meta["fps"]["num"].as_u64().unwrap(), meta["fps"]["den"].as_u64().unwrap()) {
+        Ok(f) => f,
+        Err(e) => {
+            rep.error("META", e, None);
+            rep.fatal = true;
+            return;
+        }
+    };
     let frame_count = meta["frame_count"].as_u64().unwrap() as u32;
     let max_rap = meta["max_rap_interval"].as_u64().unwrap() as u32;
     let layers: Vec<&Value> = meta["layers"].as_array().unwrap().iter().collect();
@@ -572,7 +584,7 @@ fn run(reader: &LvfReader, rep: &mut Report, check_bitstream: bool) {
         actual.push((offset, cau.frame_index, cau.flags));
         let f = cau.frame_index;
         if f != expect_next {
-            let what = if f == expect_next + 1 {
+            let what = if Some(f) == expect_next.checked_add(1) {
                 format!("frame {expect_next} is missing")
             } else if f > expect_next {
                 format!("frames {expect_next}..{} are missing", f - 1)
@@ -758,7 +770,7 @@ fn run(reader: &LvfReader, rep: &mut Report, check_bitstream: bool) {
     // I8
     let raps = rep.rap_frames.clone();
     for w in raps.windows(2) {
-        if w[1] - w[0] > max_rap {
+        if w[1].saturating_sub(w[0]) > max_rap {
             rep.error(
                 "I8",
                 format!("RAPs at {} and {} are {} frames apart (max_rap_interval {max_rap})", w[0], w[1], w[1] - w[0]),
@@ -767,7 +779,7 @@ fn run(reader: &LvfReader, rep: &mut Report, check_bitstream: bool) {
         }
     }
     if let Some(&last) = raps.last() {
-        if frame_count - last > max_rap {
+        if frame_count.saturating_sub(last) > max_rap {
             rep.warn(
                 "I8",
                 format!(
@@ -862,7 +874,7 @@ fn check_packet(rep: &mut Report, f: u32, li: usize, plane: &str, data: &[u8], f
 }
 
 fn check_index(reader: &LvfReader, rep: &mut Report, actual: &[(u64, u32, u8)], frame_count: u32) {
-    let region = reader.file_size - reader.header.index_offset;
+    let region = reader.file_size.saturating_sub(reader.header.index_offset);
     let (magic, count, entries) = match reader.index() {
         Ok(x) => x,
         Err(Error::Format(e)) | Err(Error::Value(e)) => {
