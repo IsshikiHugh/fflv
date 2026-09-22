@@ -229,3 +229,56 @@ def test_audio_track(tmp_path):
     rep = w.report
     assert rep.ok and rep.meta["audio"]["channels"] == 1 and rep.meta["audio"]["pre_skip"] > 0
     assert 48 <= rep.audio_packets <= 51  # 1 s of 20-ms packets: cut to the video
+
+
+def test_closing_rules(tmp_path):
+    import warnings
+
+    # abort in the context manager when the body raises
+    with pytest.raises(KeyError):
+        with fflv.Writer(tmp_path / "a.lvd", (16, 16)) as w:
+            w.add_layer("a")
+            w.write(a=np.zeros((16, 16, 3), np.uint8))
+            raise KeyError("stop")
+    assert not list(tmp_path.iterdir())
+    # a failed close keeps failing
+    w = fflv.Writer(tmp_path / "b.lvd", (16, 16))
+    w.add_layer("a")
+    with pytest.raises(fflv.WriterError, match="no frames"):
+        w.close()
+    with pytest.raises(fflv.WriterError, match="not written"):
+        w.close()
+    # a writer dropped with frames in it warns
+    w = fflv.Writer(tmp_path / "c.lvd", (16, 16))
+    w.add_layer("a")
+    w.write({0: np.zeros((16, 16, 3), np.uint8)})  # layers by index work too
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        del w
+        import gc
+        gc.collect()
+    assert any(issubclass(c.category, ResourceWarning) for c in caught)
+    assert not list(tmp_path.iterdir())
+
+
+def test_images_are_copied_before_encoding(tmp_path):
+    """A buffer the caller refills right after write() returns must not affect that frame."""
+    path = tmp_path / "copy.lvd"
+    buf = np.zeros((16, 16, 3), np.uint8)
+    with fflv.Writer(path, (16, 16), gop=4) as w:
+        w.add_layer("a", lossless=True)
+        for f in range(6):
+            buf[:] = f * 10
+            w.write(a=buf)
+    with fflv.open(path) as r:
+        assert all((img[:, :, 0] == f * 10).all() for f, img in r.layer_frames("a"))
+
+
+def test_reader_close(written):
+    path, _, _ = written
+    r = fflv.open(path)
+    frames = r.frames(0, 3)
+    r.close()
+    assert len(list(frames)) == 3  # an iterator already started keeps its own handle
+    with pytest.raises(ValueError, match="closed"):
+        r.frame(0)

@@ -76,7 +76,8 @@ class Reader:
         self.layers = [_layer_info(i, L) for i, L in enumerate(m["layers"])]
 
     def close(self) -> None:
-        pass  # the file is closed when the reader and its iterators are gone
+        """Close the file. Iterators already started keep their own handle until they are done."""
+        self._r.close()
 
     def __enter__(self) -> "Reader":
         return self
@@ -104,8 +105,9 @@ class Reader:
 
     def select(self, layers: Iterable | None = None, hide: Iterable | None = None) -> list[LayerInfo]:
         """Layers to show: `layers` (ids/indices) if given, else the file's visible layers; minus `hide`."""
-        chosen = [self.layer(k) for k in layers] if layers is not None else [L for L in self.layers if L.visible]
-        hidden = {self.layer(k).index for k in (hide or [])}
+        chosen = [self.layer(k) for k in _util.keys(layers)] if layers is not None else \
+            [L for L in self.layers if L.visible]
+        hidden = {self.layer(k).index for k in (_util.keys(hide, "hide") if hide is not None else [])}
         return [L for L in chosen if L.index not in hidden]
 
     @property
@@ -113,9 +115,10 @@ class Reader:
         return self._r.raps()
 
     def rap_at_or_before(self, frame: int) -> int:
-        return self._r.rap_at_or_before(int(frame))
+        return self._r.rap_at_or_before(_util.uint(frame, "frame"))
 
     def pts_us(self, frame: int) -> int:
+        frame = _util.uint(frame, "frame")
         num, den = self.fps.numerator, self.fps.denominator
         return (2 * frame * 1_000_000 * den + num) // (2 * num)
 
@@ -129,17 +132,19 @@ class Reader:
         frame (content size, before scaling to the rect). Other layers are never decoded."""
         chosen = self.select(layers) if layers is not None else self.layers
         idx = [L.index for L in chosen if L.kind == "video"]
-        return iter(self._r.decode(int(start), _util.frame_arg(end, "end"), idx))
+        return iter(self._r.decode(_util.uint(start, "start"), _util.frame_arg(end, "end"), idx))
 
     def frames(self, start: int = 0, end: int | None = None, *, layers: Iterable | None = None,
                hide: Iterable | None = None, transparent: bool = False) -> Iterator[tuple[int, np.ndarray]]:
         """Composite frames (uint8 RGB, or RGBA if `transparent`) of the chosen layers."""
-        keys = None if layers is None else [_util.key(k) for k in layers]
-        return iter(self._r.frames(int(start), _util.frame_arg(end, "end"), keys,
-                                   [_util.key(k) for k in (hide or [])], bool(transparent)))
+        keys = None if layers is None else _util.keys(layers)
+        hidden = [] if hide is None else _util.keys(hide, "hide")
+        return iter(self._r.frames(_util.uint(start, "start"), _util.frame_arg(end, "end"), keys, hidden,
+                                   bool(transparent)))
 
     def frame(self, index: int, layers: Iterable | None = None, *, hide: Iterable | None = None,
               transparent: bool = False) -> np.ndarray:
+        index = _util.uint(index, "index")
         return next(self.frames(index, index + 1, layers=layers, hide=hide, transparent=transparent))[1]
 
     def layer_frames(self, key, start: int | None = None, end: int | None = None) -> Iterator[tuple[int, np.ndarray]]:

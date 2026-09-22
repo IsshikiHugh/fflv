@@ -45,13 +45,14 @@ def add_layer(path, id: str, source, *, output=None, start: int = 0, end: int | 
     if isinstance(source, (str, os.PathLike)):
         media = os.fspath(source)
     elif callable(source):
-        images = (_util.as_uint8(source(f), id) for f in itertools.count(int(start)))
+        images = (_util.as_uint8(source(f), id) for f in itertools.count(_util.uint(start, "start")))
     else:
         length = len(source) if hasattr(source, "__len__") else None
         images = (_util.as_uint8(img, id) for img in source)
-    rep = _fflv.add_layer(os.fspath(path), id, media, images, length, _out(output), int(start),
+    rep = _fflv.add_layer(os.fspath(path), id, media, images, length, _out(output), _util.uint(start, "start"),
                           _util.frame_arg(end, "end"), alpha, bool(lossless), _util.rect(rect), _util.number(z, "z"),
-                          name, blend, _util.number(opacity, "opacity"), bool(visible), int(crf), speed, bool(check))
+                          name, blend, _util.number(opacity, "opacity"), bool(visible), _util.uint(crf, "crf", 63), speed,
+                          bool(check))
     return Report.from_json(rep)
 
 
@@ -59,14 +60,15 @@ def add_still(path, id: str, image, *, output=None, rect=None, start: int = 0, e
               z: float | None = None, name: str | None = None, blend: str = "normal", opacity: float = 1.0,
               visible: bool = True, check: bool = True) -> Report | None:
     """Append a still layer shown in frames [start, end) (default: the whole file)."""
-    rep = _fflv.add_still(os.fspath(path), id, _util.still_png(image), _out(output), _util.rect(rect), int(start),
+    rep = _fflv.add_still(os.fspath(path), id, _util.still_png(image), _out(output), _util.rect(rect),
+                          _util.uint(start, "start"),
                           _util.frame_arg(end, "end"), _util.number(z, "z"), name, blend,
                           _util.number(opacity, "opacity"), bool(visible), bool(check))
     return Report.from_json(rep)
 
 
 def remove_layers(path, keys: Iterable, *, output=None, check: bool = True) -> Report | None:
-    keys = [_util.key(k) for k in keys]
+    keys = _util.keys(keys)
     return Report.from_json(_fflv.remove_layers(os.fspath(path), keys, _out(output), bool(check)))
 
 
@@ -74,7 +76,8 @@ def set_audio(path, source, *, output=None, bitrate: str = "128k", channels: int
               check: bool = True) -> Report | None:
     """Replace the audio track with `source` (any file FFmpeg reads), or remove it (None)."""
     src = None if source is None else os.fspath(source)
-    return Report.from_json(_fflv.set_audio(os.fspath(path), src, _out(output), bitrate, int(channels), bool(check)))
+    return Report.from_json(_fflv.set_audio(os.fspath(path), src, _out(output), bitrate,
+                                            _util.uint(channels, "channels"), bool(check)))
 
 
 def set_layer(path, key, *, output=None, **fields) -> bool:
@@ -82,5 +85,8 @@ def set_layer(path, key, *, output=None, **fields) -> bool:
     Returns True when done in place (metadata only), False when the file had to be rewritten."""
     if not fields:
         raise MetaError(f"nothing to set; editable fields: {', '.join(EDITABLE_FIELDS)}")
-    pairs = json.dumps([[k, _util.jsonable(v)] for k, v in fields.items()])
+    try:
+        pairs = json.dumps([[k, _util.jsonable(v)] for k, v in fields.items()], allow_nan=False)
+    except (ValueError, TypeError):
+        raise MetaError(f"values must be JSON values with finite numbers, got {fields!r}") from None
     return _fflv.set_layer(os.fspath(path), _util.key(key), pairs, _out(output))

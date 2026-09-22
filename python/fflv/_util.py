@@ -129,6 +129,23 @@ def jsonable(v):
 def frame_arg(v, what: str) -> int | None:
     if v is None:
         return None
-    if not _is_int(v) or v < 0:
-        raise MetaError(f"{what} must be a frame number (non-negative integer), got {v!r}")
+    return uint(v, what)
+
+
+def uint(v, what: str, maximum: int | None = None) -> int:
+    """A non-negative integer (numpy integers accepted)."""
+    if not _is_int(v) or v < 0 or (maximum is not None and v > maximum):
+        limit = f" in 0..{maximum}" if maximum is not None else ""
+        raise MetaError(f"{what} must be a non-negative integer{limit}, got {v!r}")
     return int(v)
+
+
+def keys(value, what: str = "layers") -> list[str]:
+    """A list of layer ids / indices. A single id or index is one layer (a string is not split
+    into characters)."""
+    if isinstance(value, (str, numbers.Integral)) and not isinstance(value, bool):
+        return [key(value)]
+    try:
+        return [key(k) for k in value]
+    except TypeError:
+        raise MetaError(f"{what} must be a layer id / index or a list of them, got {value!r}") from None

@@ -159,3 +159,20 @@ def test_in_place_edits_alternate_and_never_grow_the_file(base):
         with fflv.open(base) as r:
             assert r.layer("b").name == "y" * n
     assert base.stat().st_size == size
+
+
+def test_single_keys_are_not_split_into_characters(base):
+    with fflv.open(base) as r:
+        assert [L.id for L in r.select(layers="b")] == ["b"]
+        assert [L.id for L in r.select(layers=1)] == ["b"]
+    fflv.remove_layers(base, "b")
+    with fflv.open(base) as r:
+        assert [L.id for L in r.layers] == ["a", "s"]
+
+
+def test_non_finite_values_are_meta_errors(base):
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(fflv.MetaError, match="finite"):
+            fflv.set_layer(base, "a", z=bad)
+    with pytest.raises(fflv.MetaError, match="non-negative"):
+        fflv.add_layer(base, "x", [np.zeros((4, 4, 3), np.uint8)], start=-1)

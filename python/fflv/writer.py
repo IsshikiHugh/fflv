@@ -23,11 +23,12 @@ Semantics
 from __future__ import annotations
 
 import os
+import warnings
 from fractions import Fraction
 from pathlib import Path
 
 from . import _fflv, _util
-from ._fflv import WriterError
+from ._fflv import MetaError, WriterError
 from .report import Report
 
 
@@ -41,9 +42,11 @@ class Writer:
             raise WriterError(f"size must be positive, got {size!r}")
         self.fps: Fraction = _util.fps(fps)
         self._w = _fflv._Writer(os.fspath(path), self.width, self.height, self.fps.numerator, self.fps.denominator,
-                                None if gop is None else int(gop), background, int(crf), speed, bool(check),
-                                threads)
+                                None if gop is None else _util.uint(gop, "gop"), background,
+                                _util.uint(crf, "crf", 63), speed, bool(check),
+                                None if threads is None else _util.uint(threads, "threads"))
         self.report: Report | None = None
+        self._close_error: BaseException | None = None
 
     @property
     def gop(self) -> int:
@@ -63,7 +66,8 @@ class Writer:
         """Declare a video layer. `rect` = (x, y, w, h) on the canvas (default: the whole canvas);
         images written to it must be w×h. `lossless` keeps pixel values exactly (bigger files)."""
         self._w.add_layer(id, bool(alpha), bool(lossless), _util.rect(rect), _util.number(z, "z"), name, blend,
-                          _util.number(opacity, "opacity"), bool(visible), crf, speed)
+                          _util.number(opacity, "opacity"), bool(visible),
+                          None if crf is None else _util.uint(crf, "crf", 63), speed)
 
     def add_still(self, id: str, image, *, rect=None, start: int = 0, end: int | None = None,
                   z: float | None = None, name: str | None = None, blend: str = "normal", opacity: float = 1.0,
@@ -72,30 +76,53 @@ class Writer:
         `image`: an image path, PNG bytes, or a uint8 array (H×W, H×W×3, H×W×4).
         Default rect: the image's own size at the top-left corner."""
         png = _util.still_png(image)
-        if end is not None and end <= start or start < 0:
+        start, end = _util.uint(start, "start"), _util.frame_arg(end, "end")
+        if end is not None and end <= start:
             raise WriterError(f"still {id!r}: bad frame range [{start}, {end})")
-        self._w.add_still(id, png, _util.rect(rect), int(start), None if end is None else int(end),
+        self._w.add_still(id, png, _util.rect(rect), start, end,
                           _util.number(z, "z"), name, blend, _util.number(opacity, "opacity"), bool(visible))
 
     def set_audio(self, src: str | os.PathLike, *, bitrate: str = "128k", channels: int = 2) -> None:
         """Audio track from any file FFmpeg can read (cut to the video length)."""
-        self._w.set_audio(os.fspath(src), bitrate, int(channels))
+        self._w.set_audio(os.fspath(src), bitrate, _util.uint(channels, "channels"))
 
     def write(self, images: dict | None = None, /, **kw) -> int:
-        """Append one composite frame. Pass images by layer id (keyword or dict). Returns the frame index."""
+        """Append one composite frame. Pass images by layer id or index (keyword or dict). Returns the
+        frame index."""
         imgs = dict(images or {})
         imgs.update(kw)
-        return self._w.write([(k, _util.as_uint8(v, k)) for k, v in imgs.items()])
+        ids = self.layer_ids
+        named = []
+        for k, v in imgs.items():
+            if _util._is_int(k):
+                if not 0 <= k < len(ids):
+                    raise MetaError(f"layer index {k} out of range (declared: {ids})")
+                k = ids[k]
+            named.append((k, _util.as_uint8(v, str(k))))
+        return self._w.write(named)
 
     def end_layer(self, id: str) -> None:
         """The layer's last frame was the previous write(); it is empty from now on."""
         self._w.end_layer(id)
 
     def close(self) -> Report | None:
-        """Finish, validate and publish the file; returns the validation report."""
+        """Finish, validate and publish the file; returns the validation report. Calling it again
+        returns the same report, or raises again if closing failed."""
+        if self._close_error is not None:
+            raise WriterError(f"{self.path} was not written: {self._close_error}") from self._close_error
         if not self._w.closed:
-            self.report = Report.from_json(self._w.close())
+            try:
+                self.report = Report.from_json(self._w.close())
+            except BaseException as e:
+                self._close_error = e
+                raise
         return self.report
+
+    def __del__(self):
+        w = getattr(self, "_w", None)
+        if w is not None and not w.closed and w.frame_count > 0:
+            warnings.warn(f"fflv.Writer for {self.path} was never closed: {w.frame_count} frames are discarded",
+                          ResourceWarning, stacklevel=2)
 
     def abort(self) -> None:
         """Discard everything written so far."""

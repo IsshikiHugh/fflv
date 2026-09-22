@@ -127,3 +127,34 @@ def test_responses_stay_consistent_while_the_file_is_replaced(tmp_path):
     assert bad == [], f"{len(bad)} of {checked} responses mixed two versions, e.g. {bad[:3]}"
     shared = {etag: sorted(map(hex, b)) for etag, b in versions_of_etag.items() if len(b) > 1}
     assert not shared, f"one ETag was served with the bytes of different versions: {list(shared.items())[:3]}"
+
+
+def test_requests_for_other_hosts_are_refused(server):
+    srv, _ = server
+    st, _, _ = get(srv.media_url, {"Host": "evil.example.com:80", "Range": "bytes=0-3"})
+    assert st == 403
+    st, _, body = get(srv.media_url, {"Host": "localhost", "Range": "bytes=0-3"})
+    assert st == 206 and body == b"LVF1"
+    st, h, body = get(srv.media_url, {"Range": "bytes=5-3"})  # not a valid range: the whole file
+    assert st == 200 and len(body) == int(h["Content-Length"])
+
+
+def test_view_from_python(packed, tmp_path):
+    import signal
+
+    import fflv
+
+    with pytest.raises(fflv.ViewError, match="no such file"):
+        fflv.view(tmp_path / "missing.lvd", open_page=False)
+    urls = []
+
+    def ready(url):
+        urls.append(url)
+        assert get(url)[0] == 200  # serving
+        threading.Timer(0.2, lambda: os.kill(os.getpid(), signal.SIGINT)).start()
+
+    with pytest.raises(KeyboardInterrupt):
+        fflv.view(packed["path"], open_page=False, ready=ready)
+    assert urls and "/?src=/media/small.lvd" in urls[0]
+    with pytest.raises(urllib.error.URLError):
+        urllib.request.urlopen(urls[0], timeout=2)  # stopped

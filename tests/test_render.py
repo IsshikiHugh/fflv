@@ -85,3 +85,22 @@ def test_extract_layer_exact(src, tmp_path):
     assert (arr[:, 4:12, 4:12] == 255).all() and (arr[:, :4] == 0).all()
     assert fflv.extract(src, "dot", tmp_path / "dot" / "%02d.png", start=10) == 2
     assert np.array_equal(read_png(tmp_path / "dot" / "11.png"), arr[11])
+
+
+def test_a_raising_progress_callback_stops_the_render(src, tmp_path):
+    seen = []
+
+    def progress(done, total):
+        seen.append(done)
+        if done == 2:
+            raise KeyError("enough")
+
+    with pytest.raises(KeyError, match="enough"):
+        fflv.render(src, tmp_path / "p" / "%02d.png", progress=progress)
+    assert seen == [1, 2]
+    assert len(list((tmp_path / "p").iterdir())) <= 2
+    with pytest.raises(fflv.MetaError, match="non-negative"):
+        fflv.render(src, tmp_path / "x.png", start=-1)
+    with fflv.open(src) as r:
+        with pytest.raises(fflv.MetaError):
+            r.frame(-1)
