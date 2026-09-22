@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/lvf", "crates/vpx-sys", "crates/fflv", "crates/fflv-python"]
+# `cargo build` / `cargo test` skip the Python extension (it needs a Python; maturin builds it)
+default-members = ["crates/lvf", "crates/vpx-sys", "crates/fflv"]
 
 [workspace.package]
 version = "0.2.0"

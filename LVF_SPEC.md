@@ -47,7 +47,7 @@ Existing approaches (MP4 with multiple tracks, several `<video>` elements stacke
 | Time model | One frame rate for the whole file; time = frame index | Layers have no timestamps of their own, so "a layer's time" fundamentally does not exist |
 | Byte order | Little-endian throughout | — |
 | Metadata | UTF-8 JSON | Personal use, easy to debug |
-| Packing tool | Python 3.10+, PyAV (`pip install av`), FFmpeg command line | — |
+| Packing tool | Python 3.10+, PyAV (`pip install av`), FFmpeg command line (the original plan; fflv is written in Rust, see the note at the top) | — |
 | Player | TypeScript + Vite, no framework, WebCodecs + WebGL2 | — |
 
 ---
@@ -529,7 +529,7 @@ The edit is instant whatever the file size. It works whenever the old and the ne
 - The file is written to a hidden temporary file (B.11); on close the metadata (into the reserved space) and the index are written, the file is validated, and only then atomically renamed to its destination.
 - Images are checked before any state changes, so a rejected image leaves the writer as it was. If encoding fails inside `write()`, the layers' encoders may be out of step with the file, so the writer refuses to continue (`write()` / `close()` raise; `abort()` discards the file).
 
-**B.9 `fflv view`**. A local HTTP server (listening on 127.0.0.1 only) serves the player and the file, with Range and ETag support.
+**B.9 `fflv view`**. A local HTTP server (listening on 127.0.0.1 by default) serves the player and the file, with Range and ETag support. On a loopback address it answers only requests whose `Host` is a loopback name, so a web page cannot reach the file through DNS rebinding. A Range header that is not a single valid range is ignored (the whole file is sent, RFC 7233); an unsatisfiable one gets 416.
 - The ETag is derived from the file's inode, size and modification time, so it changes when the file is replaced (B.11) or rewritten in place (B.5). Each request opens the file once and takes the ETag, the size and the bytes from that one open file, so a response never mixes the ETag of one version with the bytes of another.
 - The player sends `If-Match` with every range read; when the file has been replaced, the server answers 412 and the player reloads instead.
 - The player polls the ETag once a second and reloads automatically when the file changes. A reload keeps the current frame, the play state, and the layer settings the user changed in the UI; everything else takes the new file's defaults.
@@ -537,6 +537,6 @@ The edit is instant whatever the file size. It works whenever the old and the ne
 
 **B.10 Decoding in fflv** (`fflv.open` / `fflv render` / `fflv extract`) decodes only the selected layers, starting at the nearest RAP at or before the target frame, with one libvpx decoder per plane stream; the planes of a frame are decoded and converted in parallel. YUV→RGB uses the exact BT.601/709/2020 formulas as the stream signals them (not swscale, whose result depends on the frame width — when the width is not a multiple of 16, Y = 235 becomes 253 — and on the CPU), with 4:2:0 chroma taken nearest-neighbour. Compositing uses the same formulas as the WebGL player: straight alpha; layers scaled to their rect are sampled bilinearly like GL `LINEAR` with clamped edges; add is min(1, d + a·c); multiply / screen follow the W3C separable blend modes.
 
-**B.11 Publishing files.** Every writer — `fflv pack`, the edit commands and `fflv.Writer` — writes to a hidden temporary file next to the destination (`.<name>.fflv-tmp`), validates it, and only then atomically renames it over the destination. A reader of the destination (for example `fflv view`) therefore only ever sees a complete, valid file, and a failed or interrupted write leaves the previous file untouched. This replaces the in-place writing of section 8.2 step 6.
+**B.11 Publishing files.** Every writer — `fflv pack`, the edit commands and `fflv.Writer` — writes to a hidden temporary file next to the destination (`.<name>.<unique>.fflv-tmp`, unique per writer so concurrent writers never share one), syncs it to disk, validates it, and only then atomically renames it over the destination. A reader of the destination (for example `fflv view`) therefore only ever sees a complete, valid file, and a failed or interrupted write leaves the previous file untouched. This replaces the in-place writing of section 8.2 step 6.
 
 **B.12 Metadata is standard JSON.** The metadata must be RFC 8259 JSON in UTF-8 without a byte-order mark: no `NaN`, `Infinity` or other non-finite numbers (browsers' `JSON.parse` rejects them, and they would make a file unreadable in the player). Writers refuse such values and the validator reports them. Layers with equal `z` are drawn in ascending layer-index order.

@@ -1,5 +1,5 @@
 /**
- * Frame ↔ time arithmetic. Must agree bit-for-bit with fflv/format/timing.py:
+ * Frame ↔ time arithmetic. Must agree bit-for-bit with crates/lvf/src/timing.rs:
  * pts_us(f) = round(f * 1_000_000 * den / num), rounding half up, in exact integer math.
  */
 export interface Fps {

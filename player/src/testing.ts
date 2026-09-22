@@ -1,6 +1,6 @@
 /**
  * Instrumentation used by the end-to-end tests (and handy from the console): reads the frame-number
- * barcodes that `fflv testsrc` (fflv/devtools/testsrc.py) draws into every video layer back from
+ * barcodes that `fflv testsrc` (crates/fflv/src/devtools/testsrc.rs) draws into every video layer back from
  * the canvas, right after the compositor has drawn a composite frame.
  */
 import type { Player } from './player';

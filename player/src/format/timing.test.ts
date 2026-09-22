@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { formatTime, frameAtUs, ptsUs } from './timing';
 
 describe('ptsUs', () => {
-  it('matches the Python reference values', () => {
+  it('matches the reference values of crates/lvf/src/timing.rs', () => {
     expect([0, 1, 2, 3].map((f) => ptsUs(f, { num: 30, den: 1 }))).toEqual([0, 33333, 66667, 100000]);
     expect(ptsUs(1, { num: 30000, den: 1001 })).toBe(33367);
     expect(ptsUs(2, { num: 30000, den: 1001 })).toBe(66733);
