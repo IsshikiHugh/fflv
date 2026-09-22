@@ -9,7 +9,8 @@ import type { frameStats } from '../src/decode/frames';
 
 export const ASSETS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../test_assets');
 export const TEST_FILE = path.join(ASSETS, 'test.lvd');
-export const PYTHON = process.env.FFLV_PYTHON ?? 'python';
+/** The fflv command (`cargo build --release` builds it; FFLV_BIN overrides). */
+export const FFLV = process.env.FFLV_BIN ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../target/release/fflv');
 
 export interface Probes {
   canvas: [number, number];

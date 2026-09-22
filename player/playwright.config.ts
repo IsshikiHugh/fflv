@@ -11,10 +11,10 @@ export default defineConfig({
     baseURL: `http://127.0.0.1:${port}`,
     launchOptions: { args: ['--autoplay-policy=no-user-gesture-required'] },
   },
-  // `fflv view` serves the built player (fflv/viewer) and the test file with range requests.
-  // Run inside the Python environment that has fflv installed, or set FFLV_PYTHON.
+  // `fflv view` serves the player compiled into it and the test file with range requests.
+  // Build it first (`cargo build --release` after `npm run build`), or point FFLV_BIN elsewhere.
   webServer: {
-    command: `${process.env.FFLV_PYTHON ?? 'python'} -m fflv view ../test_assets/test.lvd --port ${port} --no-open`,
+    command: `${process.env.FFLV_BIN ?? '../target/release/fflv'} view ../test_assets/test.lvd --port ${port} --no-open`,
     url: `http://127.0.0.1:${port}/`,
     reuseExistingServer: false,
   },

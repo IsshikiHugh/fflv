@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   ASSETS,
-  PYTHON,
+  FFLV,
   TEST_FILE,
   assetsAvailable,
   barcodeProbe,
@@ -119,7 +119,7 @@ test.describe('following edits to the file', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fflv-e2e-'));
     file = path.join(dir, 'watched.lvd');
     fs.copyFileSync(TEST_FILE, file);
-    server = spawn(PYTHON, ['-m', 'fflv', 'view', file, '--port', String(port), '--no-open'], { stdio: 'ignore' });
+    server = spawn(FFLV, ['view', file, '--port', String(port), '--no-open'], { stdio: 'ignore' });
     for (let i = 0; i < 100; i++) {
       try {
         if ((await fetch(`http://127.0.0.1:${port}/`)).ok) return;
@@ -136,7 +136,7 @@ test.describe('following edits to the file', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  const fflv = (...args: string[]) => execFileSync(PYTHON, ['-m', 'fflv', ...args], { stdio: 'pipe' });
+  const fflv = (...args: string[]) => execFileSync(FFLV, args, { stdio: 'pipe' });
   const waitReload = (page: Page, n: number) =>
     page.waitForFunction((n) => window.__lvf.player.reloads >= n && window.__lvf.player.mode === 'paused', n, { timeout: 30_000 });
 
