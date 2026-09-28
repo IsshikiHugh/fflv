@@ -41,15 +41,14 @@ The player sources are in `player/`.
 ### Install
 
 ```bash
-pip install fflv     # the Python package and the `fflv` command; or `pipx install fflv` for the command only
+pip install -U pip   # 20.3 or newer is needed for the wheels
+pip install fflv==0.3.0 --find-links https://github.com/IsshikiHugh/fflv/releases/expanded_assets/v0.3.0
 ```
 
-Wheels are built for Linux (x86_64, aarch64; glibc ≥ 2.28, i.e. RHEL/Rocky 8+, Debian 10+,
-Ubuntu 18.10+) and macOS, for Python ≥ 3.9, with libvpx built in — nothing else to install.
-pip must be 20.3 or newer to pick them up (`pip install -U pip` first on old systems, e.g. the
-python39 package of RHEL/Rocky 8); an older pip reports "No matching distribution found".
-Standalone `fflv` binaries for the same platforms are on the
-[Releases](https://github.com/IsshikiHugh/fflv/releases) page.
+This installs the Python package and the `fflv` command. The wheels on the [release](https://github.com/IsshikiHugh/fflv/releases)
+are built for Linux (x86_64, aarch64; glibc ≥ 2.28, i.e. RHEL/Rocky 8+, Debian 10+, Ubuntu 18.10+)
+and macOS, for Python ≥ 3.9, with libvpx built in — no compiler or system libraries needed. An older
+pip reports "No matching distribution found". The release also has standalone `fflv` binaries.
 
 The FFmpeg command line is needed only for importing media files, audio and non-PNG images, and
 for video or JPEG output; everything else (writing from numpy, reading, editing, PNG output, the

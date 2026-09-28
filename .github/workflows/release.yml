@@ -1,6 +1,7 @@
 # Builds the wheels (Python package + the `fflv` command) and standalone `fflv` binaries with a
-# statically linked libvpx, so that installing needs no system libvpx. Runs on every `v*` tag and
-# publishes to PyPI (trusted publishing) and to a GitHub release; `workflow_dispatch` only builds.
+# statically linked libvpx, so that installing needs no system libvpx, and tests them on clean
+# systems. On a `v*` tag they are published to a GitHub release, and to PyPI once that is set up
+# (see the pypi job); `workflow_dispatch` only builds and tests.
 name: Release
 
 on:
@@ -159,15 +160,15 @@ jobs:
           fflv --version
           fflv --help > /dev/null
 
-  publish:
-    name: Publish to PyPI and GitHub
+  # Wheels, sdist and binaries on the GitHub release: installable with
+  # `pip install fflv --find-links https://github.com/IsshikiHugh/fflv/releases/expanded_assets/<tag>`.
+  github-release:
+    name: GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [linux, macos, sdist, test-linux]
     runs-on: ubuntu-latest
-    environment: pypi
     permissions:
-      id-token: write   # PyPI trusted publishing
-      contents: write   # the GitHub release
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -180,15 +181,31 @@ jobs:
           path: bin
           merge-multiple: true
       - run: ls -l dist bin
-      - name: PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
-          skip-existing: true
-      - name: GitHub release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           files: |
             bin/*
-            dist/*.whl
+            dist/*
           generate_release_notes: true
+
+  # PyPI, independent of the GitHub release. Runs once the repository variable PUBLISH_PYPI is
+  # "true", which is set after registering this workflow as a trusted publisher on pypi.org
+  # (workflow release.yml, environment pypi).
+  pypi:
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_PYPI == 'true'
+    needs: [linux, macos, sdist, test-linux]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
