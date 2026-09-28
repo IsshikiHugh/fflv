@@ -15,6 +15,7 @@ import {
   barcodeProbe,
   barcodes,
   loadProbes,
+  minFrames,
   mismatches,
   openViaServer,
   startRecording,
@@ -48,7 +49,7 @@ test('fflv view: plays the file through HTTP range requests, in sync', async ({ 
   await page.waitForTimeout(2500);
   await page.keyboard.press('Space');
   const samples = await stopRecording(page);
-  expect(samples.length).toBeGreaterThan(50);
+  expect(samples.length).toBeGreaterThan(minFrames(50));
   expect(mismatches(samples)).toEqual([]);
   expect((await stats(page)).p6Failures).toBe(0);
   await expect(page).toHaveTitle('test.lvd — LVF');

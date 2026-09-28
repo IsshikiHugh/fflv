@@ -26,6 +26,21 @@ export interface Probes {
   beep: { hz: number; seconds: number };
 }
 
+/**
+ * Whether throughput and audio/video latency are held to real-time standards. CI runners have no
+ * audio device, software WebGL and a few vCPUs, so there playback drops many frames (which P4
+ * allows); only the sync checks are strict. LVF_E2E_REAL_HARDWARE=1 forces the full checks.
+ */
+export const REAL_HARDWARE = !process.env.CI || process.env.LVF_E2E_REAL_HARDWARE === '1';
+
+/**
+ * The fewest frames a playback check must see: `n` on real hardware; on CI a third of it — still
+ * enough samples for the sync checks to mean something.
+ */
+export function minFrames(n: number): number {
+  return REAL_HARDWARE ? n : Math.ceil(n / 3);
+}
+
 export function loadProbes(): Probes {
   return JSON.parse(fs.readFileSync(path.join(ASSETS, 'barcodes.json'), 'utf8'));
 }

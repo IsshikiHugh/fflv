@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { assetsAvailable, barcodeProbe, barcodes, loadProbes, mismatches, openTestFile, startRecording, stats, stopRecording } from './helpers';
+import { assetsAvailable, barcodeProbe, barcodes, loadProbes, minFrames, mismatches, openTestFile, startRecording, stats, stopRecording } from './helpers';
 
 test.skip(!assetsAvailable(), 'run `fflv testsrc` first');
 
@@ -19,7 +19,7 @@ test('loads the test file and plays in sync', async ({ page }) => {
   console.log(`drawn ${samples.length} frames, last ${samples.at(-1)?.frame}, stats ${JSON.stringify(st)}`);
   console.log(JSON.stringify(await page.evaluate(() => window.__lvf.player.debugInfo())));
   expect(mismatches(samples)).toEqual([]);
-  expect(samples.length).toBeGreaterThan(60);
+  expect(samples.length).toBeGreaterThan(minFrames(60));
   expect(st.p6Failures + st.p1Failures).toBe(0);
 });
 

@@ -9,8 +9,10 @@ import {
   barcodeProbe,
   barcodes,
   loadProbes,
+  minFrames,
   mismatches,
   openTestFile,
+  REAL_HARDWARE,
   startRecording,
   stats,
   stopRecording,
@@ -79,7 +81,7 @@ test('11.2-3 continuous playback: every composite frame in sync, to the last fra
   expect(st.p6Failures + st.p1Failures).toBe(0);
   expect(samples.at(-1)!.frame).toBe(N - 1);
   for (let i = 1; i < samples.length; i++) expect(samples[i].frame).toBeGreaterThanOrEqual(samples[i - 1].frame);
-  expect(new Set(samples.map((s) => s.frame)).size).toBeGreaterThan(N * 0.9);
+  expect(new Set(samples.map((s) => s.frame)).size).toBeGreaterThan(minFrames(N * 0.9));
 });
 
 test('11.2-3 the red line stays centred on the white line', async ({ page }) => {
@@ -126,7 +128,7 @@ test('11.2-3 the red line stays centred on the white line', async ({ page }) => 
   }
   console.log(`  checked ${checked} frames`);
   expect(bad).toEqual([]);
-  expect(checked).toBeGreaterThan(100);
+  expect(checked).toBeGreaterThan(minFrames(100));
 });
 
 test('11.2-4 toggling layers, scrubbing and stepping never mixes frames', async ({ page }) => {
@@ -311,6 +313,7 @@ test('11.2-6 audio timeline: every beep starts on its whole second (pre-skip han
 });
 
 test('11.2-6 audio/video: the beep reaches the output when the white flash is shown', async ({ page }) => {
+  test.skip(!REAL_HARDWARE, 'measures audio output against the display: needs an audio device and real-time rendering');
   await openTestFile(page);
   await page.evaluate(async () => {
     const { player } = window.__lvf;
@@ -511,7 +514,7 @@ test('11.2-8 long playback: live VideoFrames and memory stay flat', async ({ pag
   expect(leaks).toEqual([]);
   expect(st.p6Failures + st.p1Failures).toBe(0);
   expect(maxOf(samples, 'live')).toBeLessThanOrEqual(9 * 18); // 9 planes × (16 in flight + ready + shown)
-  expect(samples.at(-1)!.shown).toBeGreaterThan(seconds * 20);
+  expect(samples.at(-1)!.shown).toBeGreaterThan(minFrames(seconds * 20));
   expect(maxOf(second, 'heap')).toBeLessThan(maxOf(first, 'heap') + 1e6);
   expect(maxOf(second, 'backing')).toBeLessThan(maxOf(first, 'backing') + 4e6);
 });
