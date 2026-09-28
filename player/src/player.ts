@@ -323,6 +323,11 @@ export class Player extends EventTarget {
     this.emit('layers');
   }
 
+  /** Draw the current composite frame again (after a compositor setting changed). */
+  redraw(): void {
+    this.dirty = true;
+  }
+
   // ---------------------------------------------------------------------------------------------
   // Internals
   // ---------------------------------------------------------------------------------------------

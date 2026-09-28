@@ -5,15 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>LVF Player</title>
     <meta name="description" content="Player for LVF layered video files (.lvd)" />
-    <script type="module" crossorigin src="./assets/index-Dxr66RM5.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index--QOzjfs0.css">
+    <script type="module" crossorigin src="./assets/index-OsSZYSs5.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-D3RgsFRh.css">
   </head>
   <body>
     <div id="app">
       <header class="topbar">
         <div class="brand">LVF <span>layered video player</span></div>
         <div id="file-name" class="file-name">no file loaded</div>
-        <label class="btn" for="file-input">Open .lvd…</label>
+        <button id="btn-open" class="btn" type="button">Open .lvd…</button>
         <input id="file-input" type="file" accept=".lvd,.lvf" hidden />
       </header>
 
@@ -25,36 +25,69 @@
               <div>Drop an <b>.lvd</b> file here</div>
               <small>or use “Open .lvd…”, or run <code>fflv view file.lvd</code>. Files are read in place, never uploaded.</small>
             </div>
-            <div id="sync-banner" class="sync-banner" hidden></div>
-            <div id="status" class="status" hidden></div>
+            <div id="error-card" class="error-card" hidden>
+              <h3>The file could not be played</h3>
+              <p id="error-text" class="error-text"></p>
+              <div class="error-actions">
+                <button id="btn-retry" class="btn" type="button">Try again</button>
+                <button id="btn-open-other" class="btn ghost" type="button">Open another file…</button>
+              </div>
+            </div>
+            <div id="sync-banner" class="sync-banner" hidden role="alert">
+              <span id="sync-text"></span>
+              <button id="sync-dismiss" class="sync-dismiss" type="button" aria-label="Dismiss the sync warning">✕</button>
+            </div>
+            <div id="status" class="status" hidden role="status" aria-live="polite"></div>
           </div>
 
           <div class="transport">
-            <button id="btn-back" class="icon" title="Previous frame (←)" aria-label="Previous frame">
-              <svg viewBox="0 0 24 24"><path d="M6 5h2v14H6zM20 5v14L9 12z" /></svg>
-            </button>
-            <button id="btn-play" class="icon play" title="Play / pause (Space)" aria-label="Play">
-              <svg class="i-play" viewBox="0 0 24 24"><path d="M7 4v16l13-8z" /></svg>
-              <svg class="i-pause" viewBox="0 0 24 24"><path d="M6 4h4v16H6zM14 4h4v16h-4z" /></svg>
-            </button>
-            <button id="btn-fwd" class="icon" title="Next frame (→)" aria-label="Next frame">
-              <svg viewBox="0 0 24 24"><path d="M16 5h2v14h-2zM4 5v14l11-7z" /></svg>
-            </button>
+            <div class="tgroup">
+              <button id="btn-first" class="icon" type="button" title="First frame (Home)" aria-label="First frame">
+                <svg viewBox="0 0 24 24"><path d="M5 5h2v14H5zM20 5v14L9 12z" /></svg>
+              </button>
+              <button id="btn-back" class="icon" type="button" title="Previous frame (← or ,)" aria-label="Previous frame">
+                <svg viewBox="0 0 24 24"><path d="M8 5h2v14H8zM20 5v14l-9-7z" /></svg>
+              </button>
+              <button id="btn-play" class="icon play" type="button" title="Play / pause (Space)" aria-label="Play">
+                <svg class="i-play" viewBox="0 0 24 24"><path d="M7 4v16l13-8z" /></svg>
+                <svg class="i-pause" viewBox="0 0 24 24"><path d="M6 4h4v16H6zM14 4h4v16h-4z" /></svg>
+              </button>
+              <button id="btn-fwd" class="icon" type="button" title="Next frame (→ or .)" aria-label="Next frame">
+                <svg viewBox="0 0 24 24"><path d="M14 5h2v14h-2zM4 5v14l9-7z" /></svg>
+              </button>
+              <button id="btn-last" class="icon" type="button" title="Last frame (End)" aria-label="Last frame">
+                <svg viewBox="0 0 24 24"><path d="M17 5h2v14h-2zM4 5v14l11-7z" /></svg>
+              </button>
+            </div>
             <input id="seek" class="seek" type="range" min="0" max="0" value="0" step="1" aria-label="Position" />
             <div class="readout">
               <span id="time">00:00.000</span><span class="dim"> / <span id="duration">00:00.000</span></span>
             </div>
             <div class="readout">
-              <span class="dim">frame</span> <span id="frame">0</span><span class="dim"> / <span id="frames">0</span></span>
+              <span class="dim">frame</span>
+              <button id="frame-goto" class="frame-goto" type="button" title="Go to a frame number (G)">
+                <span id="frame">0</span><span class="dim"> / <span id="frames">0</span></span>
+              </button>
+              <input id="frame-input" class="frame-input" type="text" inputmode="numeric" size="6" hidden aria-label="Go to frame number" />
             </div>
-            <label class="toggle"><input id="loop" type="checkbox" /> loop</label>
-            <label class="toggle"><input id="mute" type="checkbox" /> mute</label>
+            <div class="tgroup">
+              <label class="toggle"><input id="loop" type="checkbox" /> loop</label>
+              <label class="toggle"><input id="mute" type="checkbox" /> mute</label>
+            </div>
           </div>
-          <div id="notice" class="notice" hidden></div>
+          <div id="notice" class="notice" hidden role="status" aria-live="polite"></div>
         </section>
 
         <aside class="side">
-          <h2>Layers <span class="hint">top → bottom</span></h2>
+          <div class="side-head">
+            <label class="eye master" title="Show / hide every layer (0 shows all)">
+              <input id="vis-all" type="checkbox" aria-label="show all layers" />
+              <svg class="eye-on" viewBox="0 0 24 24"><path d="M12 5C6.5 5 2.5 9.5 1 12c1.5 2.5 5.5 7 11 7s9.5-4.5 11-7c-1.5-2.5-5.5-7-11-7zm0 11.5a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9zm0-7a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5z" /></svg>
+              <svg class="eye-off" viewBox="0 0 24 24"><path d="M3.3 2.3 2 3.6l3.2 3.2C3.3 8.3 1.8 10.2 1 12c1.5 2.5 5.5 7 11 7 2 0 3.8-.6 5.4-1.5l3 3 1.3-1.3L3.3 2.3zM12 16.5a4.5 4.5 0 0 1-3.9-6.8l1.5 1.5a2.5 2.5 0 0 0 3.2 3.2l1.5 1.5c-.7.4-1.5.6-2.3.6zm9.5-4.5c-1-1.6-3.3-4.3-6.3-5.9l-2.4-2.4C13.6 5.2 12.8 5 12 5c-.7 0-1.4.1-2 .2l7.9 7.9c.7-.4 1.4-1 2.1-1.6L23 12z" /></svg>
+            </label>
+            <h2>Layers</h2>
+            <span id="layer-count" class="count"></span>
+          </div>
           <ol id="layers" class="layers"></ol>
           <details id="debug" class="debug">
             <summary>Debug</summary>
@@ -62,8 +95,10 @@
             <label class="toggle"><input id="alpha-fix" type="checkbox" /> remap alpha 16–235 → 0–1</label>
           </details>
           <p class="keys">
-            <kbd>Space</kbd> play/pause · <kbd>←</kbd>/<kbd>→</kbd> frame step<br />
-            <kbd>1</kbd>–<kbd>9</kbd> toggle layer · <kbd>⇧</kbd>+<kbd>1</kbd>–<kbd>9</kbd> solo · <kbd>0</kbd> show all
+            <span><kbd>Space</kbd> play/pause</span> · <span><kbd>←</kbd><kbd>→</kbd> step</span> · <span><kbd>⇧</kbd>+<kbd>←</kbd><kbd>→</kbd> step 10</span><br />
+            <span><kbd>Home</kbd><kbd>End</kbd> first/last</span> · <span><kbd>G</kbd> go to frame</span><br />
+            <span><kbd>1</kbd>–<kbd>9</kbd> show/hide layer</span> · <span><kbd>0</kbd> show all</span><br />
+            <span><kbd>⇧</kbd>+<kbd>1</kbd>–<kbd>9</kbd> or <kbd>⌥</kbd>+click eye: only that layer</span>
           </p>
         </aside>
       </main>

@@ -28,10 +28,11 @@ player uses WebCodecs and WebGL2. It reads the file on demand through HTTP range
 all layers in sync with the audio, and reloads automatically when the file changes on disk.
 
 - <kbd>Space</kbd>: play / pause.
-- <kbd>←</kbd> / <kbd>→</kbd>: step one frame.
-- <kbd>1</kbd>–<kbd>9</kbd>: toggle a layer.
-- <kbd>⇧</kbd>+<kbd>1</kbd>–<kbd>9</kbd>: show only that layer.
-- <kbd>0</kbd>: show all layers.
+- <kbd>←</kbd> / <kbd>→</kbd> (or <kbd>,</kbd> / <kbd>.</kbd>): step one frame; with <kbd>⇧</kbd>: ten frames.
+- <kbd>Home</kbd> / <kbd>End</kbd>: first / last frame. <kbd>G</kbd> (or click the frame number): type a frame number.
+- <kbd>1</kbd>–<kbd>9</kbd> (or the layer's eye icon): show / hide a layer. <kbd>0</kbd> (or the eye above the list): show all.
+- <kbd>⇧</kbd>+<kbd>1</kbd>–<kbd>9</kbd> (or <kbd>⌥</kbd>+click the eye): show only that layer; again shows all.
+- Clicking a layer row opens its details: format, active frames, and the opacity slider.
 
 The player sources are in `player/`.
 
