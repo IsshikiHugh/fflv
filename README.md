@@ -117,7 +117,8 @@ maturin develop --release && python -m pytest            # Python
 cd player && npm ci && npm test && npm run build         # player: unit tests, then build it into
                                                          # crates/fflv/viewer (compiled into fflv)
 cargo build --release && ./target/release/fflv testsrc   # rebuild fflv, generate test_assets/
-cd player && npx playwright install chromium && npm run e2e   # end-to-end tests against that fflv
+cd player && npx playwright install chromium && npm run e2e -- --project chromium   # end-to-end tests
+                                                         # (without --project they also run in Edge)
 ```
 
 The built player in `crates/fflv/viewer/` is committed, so building fflv does not need Node;

@@ -131,6 +131,7 @@ export function bindUi(player: Player): void {
     else if (e.key === 'Escape') endEdit(false);
     else return;
     e.preventDefault();
+    frameGoto.focus(); // keyboard users get their place back
   });
   frameInput.addEventListener('blur', () => endEdit(true));
 
@@ -142,6 +143,7 @@ export function bindUi(player: Player): void {
     'keydown',
     (e) => {
       if (isTyping(e.target) || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.target instanceof HTMLInputElement && e.target.type === 'range' && e.target !== seek) return; // an opacity slider uses the arrows itself
       if (e.code === 'Space') {
         if (usesSpace(e.target)) return;
         e.preventDefault();
@@ -187,8 +189,9 @@ export function bindUi(player: Player): void {
   /** Show only layer i (Photoshop: Alt+click the eye); doing it to the layer already alone shows everything again. */
   const solo = (i: number) => has(i) && (isSolo(i) ? showAll() : setAll((j) => j === i));
   // The master eye hides everything while anything is shown, and shows everything otherwise.
-  visAll.addEventListener('click', (e) => {
-    e.preventDefault();
+  // (Decided on `change`, not on a cancelled `click`: cancelling a checkbox click makes the browser
+  // restore its old checked state afterwards, overwriting what the handler set.)
+  visAll.addEventListener('change', () => {
     const any = player.layerStates.some((s) => s.visible);
     setAll(() => !any);
   });
@@ -270,12 +273,14 @@ export function bindUi(player: Player): void {
       vis.className = 'vis';
       vis.checked = st.visible;
       vis.setAttribute('aria-label', `show layer ${L.name || L.id}`);
-      vis.addEventListener('click', (e) => {
-        if (!e.altKey) return;
-        e.preventDefault();
-        solo(i);
+      let altClick = false;
+      vis.addEventListener('click', (e) => (altClick = e.altKey));
+      vis.addEventListener('change', () => {
+        if (!has(i)) return;
+        if (altClick) solo(i); // the row state is re-synced from the player afterwards
+        else player.setLayerVisible(i, vis.checked);
+        altClick = false;
       });
-      vis.addEventListener('change', () => has(i) && player.setLayerVisible(i, vis.checked));
       blurAfterMouse(vis);
       eye.append(vis, svg('eye-on', EYE_ON), svg('eye-off', EYE_OFF));
       const thumb = document.createElement('canvas');

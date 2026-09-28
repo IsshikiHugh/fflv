@@ -30,7 +30,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build tools and a static libvpx
         run: |
-          yum install -y nasm git perl
+          # clang: bindgen needs libclang; nasm: libvpx's x86 assembly (not needed on arm64)
+          yum install -y git perl clang clang-devel
+          [ "$(uname -m)" = x86_64 ] && yum install -y nasm
           scripts/build-libvpx.sh /usr/local
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
@@ -62,8 +64,11 @@ jobs:
             runner: macos-14
             target: aarch64-apple-darwin
           - arch: x86_64
-            runner: macos-13
+            runner: macos-15-intel
             target: x86_64-apple-darwin
+    env:
+      # libvpx and the wheel tag must agree on the oldest macOS supported
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@v4
       - name: Build tools and a static libvpx

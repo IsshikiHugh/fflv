@@ -276,8 +276,12 @@ export class Compositor {
       gl.deleteFramebuffer(this.thumb.fbo);
       gl.deleteTexture(this.thumb.tex);
     }
+    // Create it on unit 0 and unbind: a texture that is both the render target and bound to a
+    // sampler unit is a feedback loop, and WebGL then refuses to draw.
+    gl.activeTexture(gl.TEXTURE0);
     const tex = newTexture(gl);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
     const fbo = gl.createFramebuffer()!;
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
