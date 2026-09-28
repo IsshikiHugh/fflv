@@ -6,6 +6,8 @@ export default defineConfig({
   testDir: 'e2e',
   timeout: 180_000,
   workers: 1,
+  // CI runners are slower and noisier than a laptop: give a timing-sensitive case a second chance there.
+  retries: process.env.CI ? 1 : 0,
   reporter: [['list']],
   use: {
     baseURL: `http://127.0.0.1:${port}`,

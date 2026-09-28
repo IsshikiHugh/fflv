@@ -1,0 +1,143 @@
+# Builds the wheels (Python package + the `fflv` command) and standalone `fflv` binaries with a
+# statically linked libvpx, so that installing needs no system libvpx. Runs on every `v*` tag and
+# publishes to PyPI (trusted publishing) and to a GitHub release; `workflow_dispatch` only builds.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  PKG_CONFIG_ALL_STATIC: '1'
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    # manylinux_2_28 (glibc 2.28): runs on RHEL/Alma/Rocky 8+, Debian 10+, Ubuntu 18.10+ ...
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tools and a static libvpx
+        run: |
+          yum install -y nasm git perl
+          scripts/build-libvpx.sh /usr/local
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Wheels (every CPython from 3.9 via abi3)
+        run: |
+          /opt/python/cp312-cp312/bin/pip install maturin
+          /opt/python/cp312-cp312/bin/maturin build --release --out dist --compatibility manylinux_2_28
+      - name: Standalone fflv binary
+        run: |
+          cargo build --release
+          mkdir -p bin && tar -C target/release -czf "bin/fflv-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}.tar.gz" fflv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.arch }}
+          path: dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-linux-${{ matrix.arch }}
+          path: bin/
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tools and a static libvpx
+        run: |
+          brew install nasm pkg-config
+          scripts/build-libvpx.sh "$HOME/vpx"
+          echo "PKG_CONFIG_PATH=$HOME/vpx/lib/pkgconfig" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Wheels
+        run: |
+          pip install maturin
+          maturin build --release --out dist --target ${{ matrix.target }}
+      - name: Standalone fflv binary
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          mkdir -p bin && tar -C target/${{ matrix.target }}/release -czf "bin/fflv-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}.tar.gz" fflv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.arch }}
+          path: dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-macos-${{ matrix.arch }}
+          path: bin/
+
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install maturin && maturin sdist --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI and GitHub
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # PyPI trusted publishing
+      contents: write   # the GitHub release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: bin
+          merge-multiple: true
+      - run: ls -l dist bin
+      - name: PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+      - name: GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bin/*
+            dist/*.whl
+          generate_release_notes: true

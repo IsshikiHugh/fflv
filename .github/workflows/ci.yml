@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libvpx and FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvpx-dev pkg-config libclang-dev ffmpeg
+      - name: Install libvpx and FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libvpx pkg-config ffmpeg
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release
+
+  python:
+    name: Python package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvpx-dev pkg-config libclang-dev ffmpeg
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build the extension into a virtual environment
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install maturin numpy pytest
+          maturin develop --release
+      - name: Test
+        run: |
+          . .venv/bin/activate
+          python -m pytest -q
+
+  player:
+    name: Web player
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: player/package-lock.json
+      - run: npm ci
+        working-directory: player
+      - run: npm run typecheck
+        working-directory: player
+      - run: npm test
+        working-directory: player
+      - run: npm run build
+        working-directory: player
+      - name: The built player compiled into fflv must be up to date (run `npm run build` and commit crates/fflv/viewer)
+        run: git diff --exit-code --stat -- crates/fflv/viewer
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvpx-dev pkg-config libclang-dev ffmpeg
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build fflv (the end-to-end tests run it) and generate the test material
+        run: |
+          cargo build --release
+          ./target/release/fflv testsrc
+      - run: npx playwright install --with-deps chromium
+        working-directory: player
+      - run: npx playwright test --project chromium
+        working-directory: player
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-results
+          path: player/test-results/
+          if-no-files-found: ignore

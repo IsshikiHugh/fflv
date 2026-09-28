@@ -40,13 +40,33 @@ The player sources are in `player/`.
 
 ### Install
 
-Building needs Rust ≥ 1.83, libvpx and pkg-config:
+```bash
+pip install fflv     # the Python package and the `fflv` command; or `pipx install fflv` for the command only
+```
 
-- macOS: `brew install libvpx pkg-config`
-- Debian/Ubuntu: `apt install libvpx-dev pkg-config libclang-dev`
+Wheels are built for Linux (x86_64, aarch64; glibc ≥ 2.28, i.e. RHEL/Rocky 8+, Debian 10+,
+Ubuntu 18.10+) and macOS, for Python ≥ 3.9, with libvpx built in — nothing else to install.
+Standalone `fflv` binaries for the same platforms are on the
+[Releases](https://github.com/IsshikiHugh/fflv/releases) page.
 
 The FFmpeg command line is needed only for importing media files, audio and non-PNG images, and
-for video or JPEG output.
+for video or JPEG output; everything else (writing from numpy, reading, editing, PNG output, the
+player) works without it.
+
+#### On a remote Linux server
+
+`fflv view` is a local web app: it serves the file on 127.0.0.1 and needs a desktop Chrome or Edge.
+On a headless server start it without a browser and forward the port:
+
+```bash
+fflv view debug.lvd --no-open --port 8765            # on the server
+ssh -L 8765:127.0.0.1:8765 user@server               # on your machine, then open the URL it printed
+```
+
+#### From source
+
+Needs Rust ≥ 1.83, libvpx and pkg-config (`brew install libvpx pkg-config` on macOS;
+`apt install libvpx-dev pkg-config libclang-dev` on Debian/Ubuntu):
 
 ```bash
 cargo install --path crates/fflv   # the fflv command
@@ -86,11 +106,23 @@ Run `fflv --help` or `fflv <command> --help` for all options.
 
 ## Development
 
+Prerequisites: the build dependencies above, FFmpeg (the test material is generated with it),
+Node ≥ 20 for the player, and Python ≥ 3.9 for the package.
+
 ```bash
-cargo test                                   # Rust
-pip install maturin && maturin develop --release && python -m pytest   # Python
-cd player && npm install && npm test && npm run build   # player (then rebuild fflv: it embeds the player)
+cargo test --release                                     # Rust
+python -m venv .venv && . .venv/bin/activate             # any environment works; the package is
+pip install maturin numpy pytest                         # built into the active one
+maturin develop --release && python -m pytest            # Python
+cd player && npm ci && npm test && npm run build         # player: unit tests, then build it into
+                                                         # crates/fflv/viewer (compiled into fflv)
+cargo build --release && ./target/release/fflv testsrc   # rebuild fflv, generate test_assets/
+cd player && npx playwright install chromium && npm run e2e   # end-to-end tests against that fflv
 ```
+
+The built player in `crates/fflv/viewer/` is committed, so building fflv does not need Node;
+CI checks that it matches the player sources. All of the above runs in CI
+(`.github/workflows/ci.yml`) on Linux and macOS.
 
 ## License
 
