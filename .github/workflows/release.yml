@@ -147,8 +147,10 @@ jobs:
       - name: A Python environment
         run: |
           if command -v dnf >/dev/null; then dnf install -y python39 python39-pip && python3.9 -m venv /venv; else python -m venv /venv; fi
+      # manylinux_2_28 wheels need pip ≥ 20.3; Rocky 8's python39 comes with 20.2 (README says so)
       - name: pip install the wheel and run the smoke test
         run: |
+          /venv/bin/pip install --upgrade pip
           /venv/bin/pip install --find-links dist fflv
           PATH=/venv/bin:$PATH /venv/bin/python scripts/smoke-test-install.py
       - name: The standalone binary runs

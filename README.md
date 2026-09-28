@@ -46,6 +46,8 @@ pip install fflv     # the Python package and the `fflv` command; or `pipx insta
 
 Wheels are built for Linux (x86_64, aarch64; glibc ≥ 2.28, i.e. RHEL/Rocky 8+, Debian 10+,
 Ubuntu 18.10+) and macOS, for Python ≥ 3.9, with libvpx built in — nothing else to install.
+pip must be 20.3 or newer to pick them up (`pip install -U pip` first on old systems, e.g. the
+python39 package of RHEL/Rocky 8); an older pip reports "No matching distribution found".
 Standalone `fflv` binaries for the same platforms are on the
 [Releases](https://github.com/IsshikiHugh/fflv/releases) page.
 
