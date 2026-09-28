@@ -74,19 +74,28 @@ jobs:
       - name: Build tools and a static libvpx
         run: |
           brew install nasm pkg-config
-          scripts/build-libvpx.sh "$HOME/vpx"
-          echo "PKG_CONFIG_PATH=$HOME/vpx/lib/pkgconfig" >> "$GITHUB_ENV"
+          scripts/build-libvpx.sh "$RUNNER_TEMP/vpx"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # PKG_CONFIG_PATH is set per step: setup-python overwrites it in the job environment.
       - name: Wheels
+        env:
+          PKG_CONFIG_PATH: ${{ runner.temp }}/vpx/lib/pkgconfig
         run: |
           pip install maturin
           maturin build --release --out dist --target ${{ matrix.target }}
+      - name: Install the wheel into a fresh environment (no libvpx on this runner) and smoke-test it
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --find-links dist fflv
+          PATH="$RUNNER_TEMP/venv/bin:$PATH" "$RUNNER_TEMP/venv/bin/python" scripts/smoke-test-install.py
       - name: Standalone fflv binary
+        env:
+          PKG_CONFIG_PATH: ${{ runner.temp }}/vpx/lib/pkgconfig
         run: |
           cargo build --release --target ${{ matrix.target }}
           mkdir -p bin && tar -C target/${{ matrix.target }}/release -czf "bin/fflv-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}.tar.gz" fflv
@@ -113,10 +122,45 @@ jobs:
           name: wheels-sdist
           path: dist/
 
+  # Install the wheels and the binary on clean Linux systems — no compiler, no libvpx, no FFmpeg —
+  # from the oldest supported glibc (Rocky 8, 2.28) and Python (3.9) to current ones.
+  test-linux:
+    name: Install on ${{ matrix.image }} (${{ matrix.arch }})
+    needs: [linux]
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        image: ['rockylinux:8', 'python:3.9-slim-bullseye', 'python:3.13-slim']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.arch }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-${{ matrix.arch }}
+          path: bin
+      - name: A Python environment
+        run: |
+          if command -v dnf >/dev/null; then dnf install -y python39 python39-pip && python3.9 -m venv /venv; else python -m venv /venv; fi
+      - name: pip install the wheel and run the smoke test
+        run: |
+          /venv/bin/pip install --find-links dist fflv
+          PATH=/venv/bin:$PATH /venv/bin/python scripts/smoke-test-install.py
+      - name: The standalone binary runs
+        run: |
+          tar -xzf bin/*.tar.gz -C /usr/local/bin
+          fflv --version
+          fflv --help > /dev/null
+
   publish:
     name: Publish to PyPI and GitHub
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, macos, sdist]
+    needs: [linux, macos, sdist, test-linux]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
