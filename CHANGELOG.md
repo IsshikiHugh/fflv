@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `scripts/install.sh`: installs the latest (or a chosen) release into the active Python
+  environment, or the standalone binary with `--bin`; README's install instructions use it, so they
+  name no version. Each release is installed this way on clean systems after it is published.
+- `skills/fflv`: a Claude Code skill that points to the README and `--help` for installation and
+  usage instead of repeating them.
+
 ## 0.3.0 (2026-09-27)
 
 - Player: Photoshop-style layer panel (eye toggles, live thumbnails with real alpha, details

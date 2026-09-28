@@ -406,6 +406,8 @@ crates/
   fflv-python/           the `fflv._fflv` extension module
 python/fflv/             the Python package
 tests/                   Python tests (they also exercise the command line)
+scripts/                 release tooling: static libvpx build, installer, install smoke test
+skills/fflv/             the Claude Code skill
 player/                  Vite + TypeScript
   src/
     format/              parsing of header, metadata, composite frames, index

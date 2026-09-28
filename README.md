@@ -40,15 +40,26 @@ The player sources are in `player/`.
 
 ### Install
 
+Activate the Python environment to install into (venv, conda, …), then:
+
 ```bash
-pip install -U pip   # 20.3 or newer is needed for the wheels
-pip install fflv==0.3.0 --find-links https://github.com/IsshikiHugh/fflv/releases/expanded_assets/v0.3.0
+curl -fsSL https://raw.githubusercontent.com/IsshikiHugh/fflv/main/scripts/install.sh | sh
 ```
 
-This installs the Python package and the `fflv` command. The wheels on the [release](https://github.com/IsshikiHugh/fflv/releases)
-are built for Linux (x86_64, aarch64; glibc ≥ 2.28, i.e. RHEL/Rocky 8+, Debian 10+, Ubuntu 18.10+)
-and macOS, for Python ≥ 3.9, with libvpx built in — no compiler or system libraries needed. An older
-pip reports "No matching distribution found". The release also has standalone `fflv` binaries.
+This installs the latest [release](https://github.com/IsshikiHugh/fflv/releases): the Python
+package and the `fflv` command, as a prebuilt wheel with libvpx built in — no compiler or system
+libraries needed. Add `-s -- --bin` after `sh` for the standalone `fflv` binary only (into
+`~/.local/bin`); set `FFLV_VERSION=<tag>` for another release. See
+[`scripts/install.sh`](scripts/install.sh) for what it runs and the other settings.
+
+Wheels exist for:
+
+- Linux x86_64 and aarch64 with glibc ≥ 2.28 (RHEL/Rocky/Alma 8+, Debian 10+, Ubuntu 18.10+);
+  not musl (Alpine) or older systems such as CentOS 7;
+- macOS arm64 and x86_64 (11+);
+- Python ≥ 3.9 (the script upgrades pip to ≥ 20.3 if needed; older pip cannot see the wheels).
+
+Elsewhere, build from source (below).
 
 The FFmpeg command line is needed only for importing media files, audio and non-PNG images, and
 for video or JPEG output; everything else (writing from numpy, reading, editing, PNG output, the
@@ -104,6 +115,12 @@ fflv pack    project.json -o out.lvd                    # build a file from a pr
 ```
 
 Run `fflv --help` or `fflv <command> --help` for all options.
+
+### Claude Code skill
+
+[`skills/fflv`](skills/fflv/SKILL.md) teaches Claude Code when and how to use fflv, and to install it
+from this README when it is missing. Link it into your skills:
+`ln -s "$PWD/skills/fflv" ~/.claude/skills/fflv` (from a clone of this repository).
 
 ## Development
 

@@ -160,8 +160,7 @@ jobs:
           fflv --version
           fflv --help > /dev/null
 
-  # Wheels, sdist and binaries on the GitHub release: installable with
-  # `pip install fflv --find-links https://github.com/IsshikiHugh/fflv/releases/expanded_assets/<tag>`.
+  # Wheels, sdist and binaries on the GitHub release, where scripts/install.sh finds them.
   github-release:
     name: GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
@@ -187,6 +186,38 @@ jobs:
             bin/*
             dist/*
           generate_release_notes: true
+
+  # The published release, installed exactly as README says (scripts/install.sh) on clean systems.
+  # After a tag: that release. From workflow_dispatch: the latest release, with this commit's script.
+  verify-release:
+    name: Install the release on ${{ matrix.image }}
+    needs: [github-release]
+    if: always() && (needs.github-release.result == 'success' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['rockylinux:8', 'python:3.13-slim']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python and curl
+        run: |
+          if command -v dnf >/dev/null; then dnf install -y python39 python39-pip && ln -sf /usr/bin/python3.9 /usr/local/bin/python3
+          else apt-get update && apt-get install -y --no-install-recommends curl ca-certificates; fi
+      - name: The wheel, into a fresh environment
+        env:
+          FFLV_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: |
+          python3 -m venv /venv
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/scripts/install.sh" | PYTHON=/venv/bin/python sh
+          PATH=/venv/bin:$PATH /venv/bin/python scripts/smoke-test-install.py
+      - name: The standalone binary
+        env:
+          FFLV_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/scripts/install.sh" | PYTHON=/venv/bin/python sh -s -- --bin
+          "$HOME/.local/bin/fflv" --version
 
   # PyPI, independent of the GitHub release. Runs once the repository variable PUBLISH_PYPI is
   # "true", which is set after registering this workflow as a trusted publisher on pypi.org
