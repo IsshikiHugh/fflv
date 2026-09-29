@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `fflv view` (and `fflv.view`) no longer opens a browser by default: it prints the URL. `--open`
+  (`open_page=True`) or `--browser` opens it as before; `--no-open` is still accepted.
 - `scripts/install.sh`: installs the latest (or a chosen) release into the active Python
   environment, or the standalone binary with `--bin`; README's install instructions use it, so they
   name no version. Each release is installed this way on clean systems after it is published.

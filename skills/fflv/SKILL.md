@@ -64,7 +64,7 @@ If both work, go to Step 3.
 2. Before writing code or command lines, confirm the details against the installed version with
    `--help` and `help(...)` — they are authoritative for what is installed.
 3. For format questions (layer rules, alpha, timing, what the validator checks), read `LVF_SPEC.md`.
-4. To look at a result: on a desktop, `fflv view FILE`; on a server, follow README → *On a remote
+4. To look at a result: on a desktop, `fflv view FILE --open`; on a server, follow README → *On a remote
    Linux server* and give the user the port-forwarding command and the URL.
 
 ### Step 4: Verify

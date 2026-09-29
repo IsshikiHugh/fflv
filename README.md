@@ -23,9 +23,10 @@ heat maps in separate layers and compare them frame by frame.
 
 ## Web player
 
-`fflv view` starts a small local server and opens a minimal web player in Chrome or Edge. The
-player uses WebCodecs and WebGL2. It reads the file on demand through HTTP range requests, plays
-all layers in sync with the audio, and reloads automatically when the file changes on disk.
+`fflv view` starts a small local server for a minimal web player and prints its URL; open it in
+Chrome or Edge, or pass `--open` to have fflv open it. The player uses WebCodecs and WebGL2. It
+reads the file on demand through HTTP range requests, plays all layers in sync with the audio, and
+reloads automatically when the file changes on disk.
 
 - <kbd>Space</kbd>: play / pause.
 - <kbd>←</kbd> / <kbd>→</kbd> (or <kbd>,</kbd> / <kbd>.</kbd>): step one frame; with <kbd>⇧</kbd>: ten frames.
@@ -68,10 +69,10 @@ player) works without it.
 #### On a remote Linux server
 
 `fflv view` is a local web app: it serves the file on 127.0.0.1 and needs a desktop Chrome or Edge.
-On a headless server start it without a browser and forward the port:
+On a headless server start it there and forward the port:
 
 ```bash
-fflv view debug.lvd --no-open --port 8765            # on the server
+fflv view debug.lvd --port 8765                      # on the server
 ssh -L 8765:127.0.0.1:8765 user@server               # on your machine, then open the URL it printed
 ```
 
@@ -105,7 +106,7 @@ fflv.set_layer("debug.lvd", "mask", opacity=0.5)      # edits never re-encode ex
 ### Command line
 
 ```bash
-fflv view    debug.lvd                                  # open the web player
+fflv view    debug.lvd [--open]                         # serve the web player, print its URL
 fflv info    debug.lvd                                  # layers, statistics, format checks
 fflv add     debug.lvd --src pred.mp4 --id pred --alpha # add a layer from any video file
 fflv rm      debug.lvd pred                             # remove a layer

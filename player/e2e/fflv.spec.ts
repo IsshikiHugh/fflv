@@ -120,7 +120,7 @@ test.describe('following edits to the file', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fflv-e2e-'));
     file = path.join(dir, 'watched.lvd');
     fs.copyFileSync(TEST_FILE, file);
-    server = spawn(FFLV, ['view', file, '--port', String(port), '--no-open'], { stdio: 'ignore' });
+    server = spawn(FFLV, ['view', file, '--port', String(port)], { stdio: 'ignore' });
     for (let i = 0; i < 100; i++) {
       try {
         if ((await fetch(`http://127.0.0.1:${port}/`)).ok) return;

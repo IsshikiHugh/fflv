@@ -1,4 +1,4 @@
-//! `fflv view FILE`: serve the web player and one .lvd on localhost and open Chrome / Edge.
+//! `fflv view FILE`: serve the web player and one .lvd on localhost; `--open` opens Chrome / Edge.
 //!
 //! The player reads the file through HTTP range requests, only the parts it needs, like it does
 //! with a local File. Every response carries an ETag (inode + size + mtime); the player sends it

@@ -12,8 +12,8 @@ import pytest
 
 
 class Server:
-    def __init__(self, media):
-        self.proc = subprocess.Popen([sys.executable, "-m", "fflv", "view", str(media), "--no-open"],
+    def __init__(self, media, *args):
+        self.proc = subprocess.Popen([sys.executable, "-m", "fflv", "view", str(media), *args],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         for line in self.proc.stdout:
             m = re.search(r"(http://[\d.]+:\d+)(/\?src=\S+)", line)
@@ -139,6 +139,22 @@ def test_requests_for_other_hosts_are_refused(server):
     assert st == 200 and len(body) == int(h["Content-Length"])
 
 
+@pytest.mark.parametrize("args", [(), ("--no-open",)])
+def test_the_page_is_not_opened_by_default(packed, args):
+    srv = Server(packed["path"], *args)  # --no-open is still accepted
+    threading.Event().wait(0.5)  # the page would be opened 200 ms after the server starts
+    srv.proc.kill()
+    out = srv.proc.stdout.read()
+    srv.stop()
+    assert "opened in" not in out
+
+
+def test_open_and_no_open_conflict(packed):
+    res = subprocess.run([sys.executable, "-m", "fflv", "view", str(packed["path"]), "--open", "--no-open"],
+                         capture_output=True, text=True, timeout=30)
+    assert res.returncode == 2 and "cannot be used with" in res.stderr
+
+
 def test_view_from_python(packed, tmp_path):
     import signal
 
@@ -154,7 +170,7 @@ def test_view_from_python(packed, tmp_path):
         threading.Timer(0.2, lambda: os.kill(os.getpid(), signal.SIGINT)).start()
 
     with pytest.raises(KeyboardInterrupt):
-        fflv.view(packed["path"], open_page=False, ready=ready)
+        fflv.view(packed["path"], ready=ready)  # opens no browser by default
     assert urls and "/?src=/media/small.lvd" in urls[0]
     with pytest.raises(urllib.error.URLError):
         urllib.request.urlopen(urls[0], timeout=2)  # stopped

@@ -8,7 +8,7 @@
 //!   fflv set     FILE LAYER key=value... [-o OUT]  id, name, z, rect, blend, opacity, visible (in place)
 //!   fflv render  FILE -o OUT [-l LAYERS] [--hide LAYERS] [-f RANGE]   composite to images / video / .npy
 //!   fflv extract FILE LAYER -o OUT [-f RANGE]      one layer's own pixels (RGBA)
-//!   fflv view    FILE                              open the interactive player in Chrome / Edge
+//!   fflv view    FILE [--open]                     serve the interactive player (Chrome / Edge); print its URL
 //!   fflv testsrc / fflv corrupt                    generate test material / broken files (development)
 //!
 //! LAYER is a layer id or index. RANGE is `N`, `A:B` (B excluded), `A:` or `:B`, in frames or,
@@ -132,7 +132,7 @@ enum Cmd {
         #[arg(long, default_value_t = 18)]
         crf: u32,
     },
-    /// Open the interactive player (Chrome / Edge)
+    /// Serve the interactive player (Chrome / Edge) and print its URL
     View {
         file: PathBuf,
         /// Default: the first free port from 8765
@@ -140,11 +140,14 @@ enum Cmd {
         port: u16,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        /// Default: Chrome, else Edge
+        /// Also open the page in a browser (Chrome, else Edge)
+        #[arg(long)]
+        open: bool,
+        /// Open the page in this browser (implies --open)
         #[arg(long, value_parser = ["chrome", "edge", "chromium", "default"])]
         browser: Option<String>,
-        /// Only print the URL
-        #[arg(long = "no-open")]
+        /// Only print the URL (the default; kept for older scripts)
+        #[arg(long = "no-open", hide = true, conflicts_with_all = ["open", "browser"])]
         no_open: bool,
         /// Log requests
         #[arg(short, long)]
@@ -495,9 +498,9 @@ fn run(cli: Cli) -> Result<i32> {
             println!("wrote {count} frame(s) of {layer:?} to {output} in {:.1} s", t0.elapsed().as_secs_f64());
             Ok(0)
         }
-        Cmd::View { file, port, host, browser, no_open, verbose } => {
+        Cmd::View { file, port, host, open, browser, no_open: _, verbose } => {
             LvfReader::open(&file)?; // fail early on something that is not an .lvd
-            crate::view::serve(&file, &host, port, browser.as_deref(), !no_open, !verbose)?;
+            crate::view::serve(&file, &host, port, browser.as_deref(), open || browser.is_some(), !verbose)?;
             Ok(0)
         }
         Cmd::Testsrc { out, width, height, fps, duration, gop, crf, no_pack } => {

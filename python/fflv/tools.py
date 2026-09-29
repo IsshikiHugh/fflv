@@ -50,13 +50,15 @@ def extract(path, layer, output, *, start: int | None = None, end: int | None = 
                                _util.frame_arg(end, "end"), _util.uint(crf, "crf", 63), progress)
 
 
-def view(path, *, port: int = 0, host: str = "127.0.0.1", browser: str | None = None, open_page: bool = True,
+def view(path, *, port: int = 0, host: str = "127.0.0.1", browser: str | None = None, open_page: bool = False,
          ready: Callable[[str], None] | None = None) -> None:
-    """Serve the web player for `path` and open it in Chrome / Edge; blocks until Ctrl+C
-    (KeyboardInterrupt). `ready(url)` is called once the server listens (default: print the URL).
+    """Serve the web player for `path`; blocks until Ctrl+C (KeyboardInterrupt). `ready(url)` is
+    called once the server listens (default: print the URL). `open_page=True` or a `browser`
+    ("chrome", "edge", "chromium", "default") also opens the page (default: Chrome, else Edge).
     Raises ViewError when the file cannot be served."""
     if ready is None:
         def ready(url: str) -> None:
             print(f"serving {os.fspath(path)} at\n  {url}\n(the page follows changes to the file; Ctrl+C to stop)",
                   flush=True)
-    _fflv.view(os.fspath(path), host, _util.uint(port, "port", 65535), browser, bool(open_page), ready)
+    _fflv.view(os.fspath(path), host, _util.uint(port, "port", 65535), browser,
+               bool(open_page) or browser is not None, ready)

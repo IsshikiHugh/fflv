@@ -16,7 +16,7 @@ export default defineConfig({
   // `fflv view` serves the player compiled into it and the test file with range requests.
   // Build it first (`cargo build --release` after `npm run build`), or point FFLV_BIN elsewhere.
   webServer: {
-    command: `${process.env.FFLV_BIN ?? '../target/release/fflv'} view ../test_assets/test.lvd --port ${port} --no-open`,
+    command: `${process.env.FFLV_BIN ?? '../target/release/fflv'} view ../test_assets/test.lvd --port ${port}`,
     url: `http://127.0.0.1:${port}/`,
     reuseExistingServer: false,
   },
