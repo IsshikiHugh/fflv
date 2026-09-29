@@ -10,8 +10,8 @@
 - `skills/fflv`: a Claude Code skill that points to the README and `--help` for installation and
   usage instead of repeating them.
 - Player: the layer panel can be dragged wider (its left edge; double-click resets), so long layer
-  names show in full. Layer thumbnails can be shown over a checkerboard, black or white (switch at
-  the top of the panel). Both choices are kept in the browser.
+  names show in full. Layer thumbnails can be shown over a checkerboard (white and light gray, as in
+  Photoshop), black or white (switch at the top of the panel). Both choices are kept in the browser.
 
 ## 0.3.0 (2026-09-27)
 
