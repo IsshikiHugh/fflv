@@ -110,6 +110,77 @@ test('number keys toggle, solo and restore layers', async ({ page }) => {
   expect((await visible()).every(Boolean)).toBe(true);
 });
 
+test('the layer panel can be dragged wider, so long names show in full; the width is kept', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 800 });
+  await openViaServer(page);
+  const side = page.locator('.side');
+  const name = page.locator('#layers li .name').first();
+  await name.evaluate((el) => el.append(' — a longer name than fits by default'));
+  const truncated = () => name.evaluate((el) => el.scrollWidth > el.clientWidth);
+  expect(Math.round((await side.boundingBox())!.width)).toBe(300);
+  expect(await truncated()).toBe(true);
+
+  const edge = (await page.locator('#side-resize').boundingBox())!;
+  const x = edge.x + edge.width / 2;
+  const y = edge.y + 200;
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.mouse.move(x - 150, y, { steps: 5 });
+  await page.mouse.move(x - 300, y, { steps: 5 });
+  await page.mouse.up();
+  expect(Math.round((await side.boundingBox())!.width)).toBe(600);
+  expect(await truncated()).toBe(false);
+  // the handle does not keep the focus: the arrow keys still step frames
+  await page.keyboard.press('ArrowRight');
+  await expect.poll(() => page.evaluate(() => window.__lvf.player.currentFrame)).toBe(1);
+
+  // never wider than the window allows (the video keeps 360px)
+  await page.mouse.move(x - 300, y);
+  await page.mouse.down();
+  await page.mouse.move(0, y, { steps: 5 });
+  await page.mouse.up();
+  expect(Math.round((await side.boundingBox())!.width)).toBe(1400 - 360);
+
+  await page.reload();
+  await page.waitForFunction(() => window.__lvf.player.mode === 'paused');
+  expect(Math.round((await side.boundingBox())!.width)).toBe(1400 - 360);
+  await page.locator('#side-resize').dblclick();
+  expect(Math.round((await side.boundingBox())!.width)).toBe(300);
+});
+
+test('thumbnail background: checkerboard, black or white; thumbnails ignore opacity, keep their own alpha', async ({ page }) => {
+  await openViaServer(page);
+  const ids = await page.evaluate(() => window.__lvf.player.source!.meta.layers.map((L) => L.id));
+  const thumb = (id: string) => page.locator(`#layers li[data-index="${ids.indexOf(id)}"] canvas.thumb`);
+  const bgOf = (id: string) => thumb(id).evaluate((el) => getComputedStyle(el).backgroundImage + ' ' + getComputedStyle(el).backgroundColor);
+  expect(await bgOf('bg')).toContain('conic-gradient');
+  await page.getByRole('radio', { name: 'white' }).click();
+  expect(await bgOf('bg')).toBe('none rgb(255, 255, 255)');
+  await page.getByRole('radio', { name: 'black' }).click();
+  expect(await bgOf('calib')).toBe('none rgb(0, 0, 0)');
+
+  // a layer at 20% opacity still has a fully opaque thumbnail (outside the letterbox) ...
+  await page.evaluate((i) => window.__lvf.player.setLayerOpacity(i, 0.2), ids.indexOf('bg'));
+  await seek(page, 10);
+  const alphas = (id: string) =>
+    thumb(id).evaluate((el: HTMLCanvasElement) => {
+      const d = el.getContext('2d')!.getImageData(0, 0, el.width, el.height).data;
+      const a: number[] = [];
+      for (let i = 3; i < d.length; i += 4) a.push(d[i]);
+      return a;
+    });
+  await expect.poll(async () => (await alphas('bg')).filter((a) => a > 0).length).toBeGreaterThan(80 * 40);
+  expect((await alphas('bg')).every((a) => a === 0 || a === 255)).toBe(true);
+  // ... while a layer's own transparency (the calibration ramp) shows through
+  const calib = await alphas('calib');
+  expect(calib.some((a) => a > 0 && a < 255)).toBe(true);
+
+  await page.reload();
+  await page.waitForFunction(() => window.__lvf.player.mode === 'paused');
+  await expect(page.getByRole('radio', { name: 'black' })).toBeChecked();
+  expect(await bgOf('bg')).toBe('none rgb(0, 0, 0)');
+});
+
 test.describe('following edits to the file', () => {
   let server: ChildProcess;
   let dir: string;

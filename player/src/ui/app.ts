@@ -21,6 +21,26 @@ const usesSpace = (t: EventTarget | null) =>
   t instanceof HTMLElement && t.matches('button, a[href], summary, select, textarea, input:not([type=range])');
 const isTyping = (t: EventTarget | null) =>
   (t instanceof HTMLInputElement && t.type === 'text') || t instanceof HTMLTextAreaElement;
+/** Controls that use the arrow keys (and Home / End) themselves: the thumbnail background choice, the panel's resize handle. */
+const usesArrows = (t: EventTarget | null) => t instanceof HTMLElement && t.matches('input[type=radio], [role=separator]');
+
+/** UI preferences kept in this browser; storage may be unavailable (private windows, blocked site data). */
+const pref = {
+  get: (key: string) => {
+    try {
+      return localStorage.getItem(`lvf.${key}`);
+    } catch {
+      return null;
+    }
+  },
+  set: (key: string, value: string) => {
+    try {
+      localStorage.setItem(`lvf.${key}`, value);
+    } catch {
+      /* not kept, still applied */
+    }
+  },
+};
 
 export function bindUi(player: Player): void {
   const stage = $<HTMLDivElement>('stage');
@@ -57,6 +77,10 @@ export function bindUi(player: Player): void {
   const debugList = $<HTMLDListElement>('debug-list');
   const debug = $<HTMLDetailsElement>('debug');
   const alphaFix = $<HTMLInputElement>('alpha-fix');
+  const layout = document.querySelector<HTMLElement>('.layout')!;
+  const side = document.querySelector<HTMLElement>('.side')!;
+  const resizer = $<HTMLDivElement>('side-resize');
+  const thumbBgs = [...document.querySelectorAll<HTMLInputElement>('input[name=thumb-bg]')];
 
   // ---- opening files ------------------------------------------------------------------------
   const open = (file: File) => {
@@ -144,6 +168,7 @@ export function bindUi(player: Player): void {
     (e) => {
       if (isTyping(e.target) || e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.target instanceof HTMLInputElement && e.target.type === 'range' && e.target !== seek) return; // an opacity slider uses the arrows itself
+      if (usesArrows(e.target) && /^(Arrow.*|Home|End)$/.test(e.code)) return;
       if (e.code === 'Space') {
         if (usesSpace(e.target)) return;
         e.preventDefault();
@@ -177,6 +202,70 @@ export function bindUi(player: Player): void {
     { capture: true },
   );
   window.addEventListener('keyup', (e) => e.code === 'Space' && !usesSpace(e.target) && e.preventDefault(), { capture: true });
+
+  // ---- panel width ------------------------------------------------------------------------------
+  // Drag the panel's left edge (or focus it and use ←/→) to make room for long layer names;
+  // double-click (or Enter) goes back to the default 300px. The CSS keeps the video at least 360px wide.
+  const SIDE_MIN = 240;
+  const RESIZE_STEP = 20;
+  const sideWidth = () => side.getBoundingClientRect().width;
+  const setSideWidth = (px: number | null, keep = true) => {
+    if (px === null) layout.style.removeProperty('--side-w');
+    else layout.style.setProperty('--side-w', `${Math.round(Math.max(SIDE_MIN, Math.min(px, window.innerWidth - 360)))}px`);
+    resizer.setAttribute('aria-valuenow', String(Math.round(sideWidth())));
+    if (keep) pref.set('sideWidth', px === null ? '' : String(Math.round(sideWidth())));
+  };
+  const savedWidth = Number(pref.get('sideWidth'));
+  setSideWidth(savedWidth > 0 ? savedWidth : null, false);
+  resizer.setAttribute('aria-valuemin', String(SIDE_MIN));
+  let dragFrom: { x: number; width: number } | null = null;
+  resizer.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault(); // no text selection, no focus: the arrow keys keep stepping frames
+    resizer.setPointerCapture(e.pointerId);
+    dragFrom = { x: e.clientX, width: sideWidth() };
+    resizer.classList.add('dragging');
+    document.body.classList.add('resizing');
+  });
+  resizer.addEventListener('pointermove', (e) => {
+    if (dragFrom) setSideWidth(dragFrom.width + dragFrom.x - e.clientX, false);
+  });
+  const endDrag = () => {
+    if (!dragFrom) return;
+    dragFrom = null;
+    resizer.classList.remove('dragging');
+    document.body.classList.remove('resizing');
+    setSideWidth(sideWidth());
+  };
+  resizer.addEventListener('pointerup', endDrag);
+  resizer.addEventListener('pointercancel', endDrag);
+  resizer.addEventListener('dblclick', () => setSideWidth(null));
+  resizer.addEventListener('keydown', (e) => {
+    const d = { ArrowLeft: RESIZE_STEP, ArrowRight: -RESIZE_STEP }[e.code];
+    if (d !== undefined) setSideWidth(sideWidth() + d * (e.shiftKey ? 5 : 1));
+    else if (e.code === 'Home' || e.code === 'End') setSideWidth(e.code === 'Home' ? SIDE_MIN : window.innerWidth);
+    else if (e.code === 'Enter') setSideWidth(null);
+    else return;
+    e.preventDefault();
+  });
+  window.addEventListener('resize', () => resizer.setAttribute('aria-valuenow', String(Math.round(sideWidth()))));
+
+  // ---- thumbnail background -----------------------------------------------------------------------
+  // Thumbnails keep their transparency (a layer's own alpha); what shows through is a
+  // checkerboard, black or white, chosen once for every layer.
+  const setThumbBg = (bg: string) => {
+    const box = thumbBgs.find((b) => b.value === bg) ?? thumbBgs[0];
+    box.checked = true;
+    layersEl.dataset.thumbBg = box.value;
+  };
+  setThumbBg(pref.get('thumbBg') ?? 'checker');
+  for (const b of thumbBgs) {
+    blurAfterMouse(b);
+    b.addEventListener('change', () => {
+      setThumbBg(b.value);
+      pref.set('thumbBg', b.value);
+    });
+  }
 
   // ---- layer panel ------------------------------------------------------------------------------
   /** Layer indices in panel order (top of the stack first); number keys follow this order. */

@@ -77,6 +77,15 @@
           <div id="notice" class="notice" hidden role="status" aria-live="polite"></div>
         </section>
 
+        <div
+          id="side-resize"
+          class="side-resize"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize the layer panel"
+          tabindex="0"
+          title="Drag to resize the layer panel · double-click: default width"
+        ></div>
         <aside class="side">
           <div class="side-head">
             <label class="eye master" title="Show / hide every layer (0 shows all)">
@@ -86,6 +95,11 @@
             </label>
             <h2>Layers</h2>
             <span id="layer-count" class="count"></span>
+            <div class="thumb-bg" role="radiogroup" aria-label="Thumbnail background">
+              <label class="swatch checker" title="Thumbnail background: checkerboard"><input type="radio" name="thumb-bg" value="checker" checked aria-label="checkerboard" /></label>
+              <label class="swatch black" title="Thumbnail background: black"><input type="radio" name="thumb-bg" value="black" aria-label="black" /></label>
+              <label class="swatch white" title="Thumbnail background: white"><input type="radio" name="thumb-bg" value="white" aria-label="white" /></label>
+            </div>
           </div>
           <ol id="layers" class="layers"></ol>
           <details id="debug" class="debug">
