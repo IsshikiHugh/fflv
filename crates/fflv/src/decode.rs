@@ -194,7 +194,9 @@ impl Reader {
                 Ok(LayerDecoder { index: i, width: w, height: h, full: l.alpha_full_range(), color, alpha })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Decoding { caus: CauIter::new(self.file.clone(), Some(from), Some(to)), start, end, planes, done: false })
+        // Without video layers there is nothing to read: the frames are just numbered.
+        let caus = (!planes.is_empty()).then(|| CauIter::new(self.file.clone(), Some(from), Some(to)));
+        Ok(Decoding { caus, next: start, start, end, planes, done: false })
     }
 
     /// Composite frames (RGB, or RGBA when `transparent`) of the chosen layers over [start, end).
@@ -351,7 +353,10 @@ impl LayerDecoder {
 
 /// Decoding session (see [`Reader::decode`]).
 pub struct Decoding {
-    caus: CauIter<Arc<LvfReader>>,
+    /// None when no video layer is decoded (see `next`)
+    caus: Option<CauIter<Arc<LvfReader>>>,
+    /// the next frame number, when there are no CAUs to read
+    next: u32,
     start: u32,
     end: u32,
     planes: Vec<LayerDecoder>,
@@ -360,8 +365,17 @@ pub struct Decoding {
 
 impl Decoding {
     fn step(&mut self) -> Option<Result<(u32, BTreeMap<usize, LayerFrame>)>> {
+        let Some(caus) = self.caus.as_mut() else {
+            if self.next >= self.end {
+                return None;
+            }
+            self.next += 1;
+            return Some(Ok((self.next - 1, BTreeMap::new())));
+        };
         loop {
-            let (_, cau, _) = match self.caus.next()? {
+            // the packets are borrowed from the reader's buffer (until the next CAU): nothing
+            // is copied, not even for the chosen layers, since libvpx reads them in place
+            let (_, cau, _) = match caus.next_ref()? {
                 Ok(c) => c,
                 Err(e) => return Some(Err(e.into())),
             };
@@ -370,7 +384,7 @@ impl Decoding {
                 return None;
             }
             let convert = f >= self.start;
-            let mut jobs: Vec<(&mut LayerDecoder, &lvf::VideoEntry)> = Vec::new();
+            let mut jobs: Vec<(&mut LayerDecoder, &lvf::VideoEntryRef)> = Vec::new();
             let mut entries = cau.entries.iter().filter(|e| e.kind == ENTRY_FRAME).peekable();
             for d in self.planes.iter_mut() {
                 while entries.peek().is_some_and(|e| (e.layer_index as usize) < d.index) {
@@ -381,7 +395,7 @@ impl Decoding {
                 }
             }
             let results: Vec<Result<(usize, Option<LayerFrame>)>> =
-                jobs.into_par_iter().map(|(d, e)| Ok((d.index, d.run(&e.color, &e.alpha, convert)?))).collect();
+                jobs.into_par_iter().map(|(d, e)| Ok((d.index, d.run(e.color, e.alpha, convert)?))).collect();
             if !convert {
                 if let Some(Err(e)) = results.into_iter().find(|r| r.is_err()) {
                     return Some(Err(e));
