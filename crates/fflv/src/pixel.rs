@@ -119,7 +119,7 @@ fn i420_rows<const C: usize>(r0: &[u8], r1: &[u8], w: usize, y0: &mut [u8], y1: 
 /// BT.709 limited-range 4:2:0 picture of size `cw`×`ch` (even) from `src` (padded by repetition).
 /// With alpha, chroma is alpha-weighted (see [`block`]).
 pub fn color_i420(src: ImageRef, cw: u32, ch: u32) -> Planar {
-    debug_assert!(cw % 2 == 0 && ch % 2 == 0 && cw >= src.width && ch >= src.height);
+    debug_assert!(cw.is_multiple_of(2) && ch.is_multiple_of(2) && cw >= src.width && ch >= src.height);
     let mut out = Planar::new(PlaneFormat::I420, cw, ch);
     let w = src.width as usize;
     let (cwu, half) = (cw as usize, (cw / 2) as usize);
