@@ -38,6 +38,8 @@ manifest-path = "crates/fflv-python/Cargo.toml"
 python-source = "python"
 module-name = "fflv._fflv"
 features = ["pyo3/extension-module"]
+# the built player (not tracked; release.yml builds it first): the sdist builds without Node
+include = [{ path = "crates/fflv/viewer/**/*", format = "sdist" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

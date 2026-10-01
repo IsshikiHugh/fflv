@@ -12,8 +12,29 @@ on:
 env:
   CARGO_TERM_COLOR: always
   PKG_CONFIG_ALL_STATIC: '1'
+  # the web player is built once (job player) and compiled into every build from
+  # crates/fflv/viewer (crates/fflv/build.rs); a build without it fails
+  FFLV_PLAYER: prebuilt
 
 jobs:
+  player:
+    name: Web player
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: player/package-lock.json
+      - run: npm ci && npm run build
+        working-directory: player
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viewer
+          path: crates/fflv/viewer/
+          if-no-files-found: error
+
   linux:
     name: Linux ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
@@ -27,8 +48,13 @@ jobs:
             runner: ubuntu-24.04-arm
     # manylinux_2_28 (glibc 2.28): runs on RHEL/Alma/Rocky 8+, Debian 10+, Ubuntu 18.10+ ...
     container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    needs: [player]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: viewer
+          path: crates/fflv/viewer
       - name: Build tools and a static libvpx
         run: |
           # clang: bindgen needs libclang; nasm: libvpx's x86 assembly (not needed on arm64)
@@ -67,11 +93,16 @@ jobs:
           - arch: x86_64
             runner: macos-15-intel
             target: x86_64-apple-darwin
+    needs: [player]
     env:
       # libvpx and the wheel tag must agree on the oldest macOS supported
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: viewer
+          path: crates/fflv/viewer
       - name: Build tools and a static libvpx
         run: |
           brew install nasm pkg-config
@@ -112,8 +143,13 @@ jobs:
   sdist:
     name: Source distribution
     runs-on: ubuntu-latest
+    needs: [player]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: viewer
+          path: crates/fflv/viewer
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'

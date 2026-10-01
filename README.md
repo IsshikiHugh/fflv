@@ -85,7 +85,9 @@ ssh -L 8765:127.0.0.1:8765 user@server               # on your machine, then ope
 #### From source
 
 Needs Rust ≥ 1.89, libvpx and pkg-config (`brew install libvpx pkg-config` on macOS;
-`apt install libvpx-dev pkg-config libclang-dev` on Debian/Ubuntu):
+`apt install libvpx-dev pkg-config libclang-dev` on Debian/Ubuntu), and Node.js ≥ 20 with npm for
+the web player, which is built into fflv as it compiles (without npm, fflv builds without it and
+`fflv view` reports that):
 
 ```bash
 cargo install --path crates/fflv   # the fflv command
@@ -139,15 +141,17 @@ cargo test --release                                     # Rust
 python -m venv .venv && . .venv/bin/activate             # any environment works; the package is
 pip install maturin numpy pytest                         # built into the active one
 maturin develop --release && python -m pytest            # Python
-cd player && npm ci && npm test && npm run build         # player: unit tests, then build it into
-                                                         # crates/fflv/viewer (compiled into fflv)
-cargo build --release && ./target/release/fflv testsrc   # rebuild fflv, generate test_assets/
+cd player && npm ci && npm test                          # player: unit tests
+cargo build --release && ./target/release/fflv testsrc   # fflv with the player, test_assets/
 cd player && npx playwright install chromium && npm run e2e -- --project chromium   # end-to-end tests
                                                          # (without --project they also run in Edge)
 ```
 
-The built player in `crates/fflv/viewer/` is committed, so building fflv does not need Node;
-CI checks that it matches the player sources. All of the above runs in CI
+Building fflv builds the player from `player/` (`crates/fflv/build.rs`, whenever its sources
+change), so after editing the player, `cargo build` or `maturin develop` is all it takes; the built
+player is not tracked. `FFLV_PLAYER` changes that: `skip` builds fflv without the player, `prebuilt`
+takes it from `crates/fflv/viewer` (what `npm run build` writes; release builds build it once this
+way), and `build` fails when npm is missing (CI). All of the above runs in CI
 (`.github/workflows/ci.yml`) on Linux and macOS.
 
 ## License

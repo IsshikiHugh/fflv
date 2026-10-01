@@ -13,8 +13,8 @@ python/fflv/*.pyd
 # player
 player/node_modules/
 player/dist/
-# note: crates/fflv/viewer/ (the built player) IS kept: it is compiled into the fflv binary,
-# so building fflv does not need Node
+# the built player: build.rs builds it into the fflv binary (`npm run build` writes it here)
+crates/fflv/viewer/
 player/test-results/
 player/playwright-report/
 # rust
