@@ -81,6 +81,20 @@ impl LayerEncoder {
         self.alpha.is_some()
     }
 
+    /// Number of plane streams (and encoders): 1, or 2 with alpha.
+    pub fn streams(&self) -> usize {
+        1 + self.alpha.is_some() as usize
+    }
+
+    /// libvpx threads of each plane encoder; before the first frame only.
+    pub fn set_threads(&mut self, threads: u32) -> Result<()> {
+        self.color.set_threads(threads)?;
+        if let Some(a) = &mut self.alpha {
+            a.set_threads(threads)?;
+        }
+        Ok(())
+    }
+
     /// Check and convert an image (gray, RGB or RGBA; without alpha it is opaque).
     pub fn prepare(&self, img: ImageRef) -> Result<Prepared> {
         if (img.width, img.height) != (self.width, self.height) {

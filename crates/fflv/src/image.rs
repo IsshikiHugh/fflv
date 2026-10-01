@@ -78,6 +78,14 @@ impl<'a> ImageRef<'a> {
         }
     }
 
+    /// Row `y` (clamped to the last row): `width * channels` bytes.
+    #[inline]
+    pub fn row(&self, y: u32) -> &'a [u8] {
+        let data: &'a [u8] = self.data;
+        let len = self.width as usize * self.channels as usize;
+        &data[y.min(self.height - 1) as usize * len..][..len]
+    }
+
     pub fn has_alpha(&self) -> bool {
         self.channels == 4
     }
@@ -86,11 +94,15 @@ impl<'a> ImageRef<'a> {
         if self.channels == 4 {
             return Image { width: self.width, height: self.height, channels: 4, data: self.data.to_vec() };
         }
-        let mut data = Vec::with_capacity(self.width as usize * self.height as usize * 4);
-        for p in self.data.chunks_exact(self.channels as usize) {
-            match p.len() {
-                1 => data.extend_from_slice(&[p[0], p[0], p[0], 255]),
-                _ => data.extend_from_slice(&[p[0], p[1], p[2], 255]),
+        let mut data = vec![255u8; self.width as usize * self.height as usize * 4];
+        let out = data.chunks_exact_mut(4);
+        if self.channels == 1 {
+            for (o, &v) in out.zip(self.data) {
+                o[..3].fill(v);
+            }
+        } else {
+            for (o, p) in out.zip(self.data.chunks_exact(3)) {
+                o[..3].copy_from_slice(p);
             }
         }
         Image { width: self.width, height: self.height, channels: 4, data }
@@ -100,11 +112,15 @@ impl<'a> ImageRef<'a> {
         if self.channels == 3 {
             return Image { width: self.width, height: self.height, channels: 3, data: self.data.to_vec() };
         }
-        let mut data = Vec::with_capacity(self.width as usize * self.height as usize * 3);
-        for p in self.data.chunks_exact(self.channels as usize) {
-            match p.len() {
-                1 => data.extend_from_slice(&[p[0], p[0], p[0]]),
-                _ => data.extend_from_slice(&p[..3]),
+        let mut data = vec![0u8; self.width as usize * self.height as usize * 3];
+        let out = data.chunks_exact_mut(3);
+        if self.channels == 1 {
+            for (o, &v) in out.zip(self.data) {
+                o.fill(v);
+            }
+        } else {
+            for (o, p) in out.zip(self.data.chunks_exact(4)) {
+                o.copy_from_slice(&p[..3]);
             }
         }
         Image { width: self.width, height: self.height, channels: 3, data }

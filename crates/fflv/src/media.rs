@@ -55,28 +55,46 @@ pub fn run(cmd: &mut Command, what: &str) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Pixel formats FFmpeg knows to carry alpha.
-fn alpha_formats() -> &'static HashSet<String> {
-    static FORMATS: OnceLock<HashSet<String>> = OnceLock::new();
-    FORMATS.get_or_init(|| {
-        let mut cmd = Command::new("ffprobe");
-        cmd.args(["-v", "error", "-show_pixel_formats", "-of", "json"]);
-        let Ok(out) = run(&mut cmd, "ffprobe -show_pixel_formats") else { return HashSet::new() };
-        let v: Value = serde_json::from_slice(&out).unwrap_or(Value::Null);
-        v["pixel_formats"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter(|f| f["flags"]["alpha"].as_i64() == Some(1))
-                    .filter_map(|f| f["name"].as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
+/// Pixel formats FFmpeg knows to carry alpha (None: ffprobe could not list them).
+fn alpha_formats() -> Option<&'static HashSet<String>> {
+    static FORMATS: OnceLock<Option<HashSet<String>>> = OnceLock::new();
+    FORMATS
+        .get_or_init(|| {
+            let mut cmd = Command::new("ffprobe");
+            cmd.args(["-v", "error", "-show_pixel_formats", "-of", "json"]);
+            let listed: Option<HashSet<String>> = run(&mut cmd, "ffprobe -show_pixel_formats").ok().and_then(|out| {
+                let v: Value = serde_json::from_slice(&out).ok()?;
+                let formats = v["pixel_formats"].as_array()?;
+                Some(
+                    formats
+                        .iter()
+                        .filter(|f| f["flags"]["alpha"].as_i64() == Some(1))
+                        .filter_map(|f| f["name"].as_str().map(String::from))
+                        .collect(),
+                )
+            });
+            let listed = listed.filter(|set| !set.is_empty());
+            if listed.is_none() {
+                eprintln!("warning: ffprobe -show_pixel_formats failed; guessing which pixel formats have alpha");
+            }
+            listed
+        })
+        .as_ref()
+}
+
+/// Whether a pixel format has alpha, by name, for when ffprobe cannot tell (rgba, bgra, argb,
+/// abgr, rgba64le, yuva420p, yuva444p10le, gbrap, gbrap16be, ya8, ya16le, pal8, ...).
+fn guess_alpha(name: &str) -> bool {
+    const PREFIXES: [&str; 11] =
+        ["rgba", "bgra", "argb", "abgr", "yuva", "gbrap", "ya8", "ya16", "ayuv", "vuya", "pal8"];
+    PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 pub fn pix_fmt_has_alpha(name: &str) -> bool {
-    alpha_formats().contains(name)
+    match alpha_formats() {
+        Some(set) => set.contains(name),
+        None => guess_alpha(name),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -238,4 +256,19 @@ pub fn still_png_from_bytes(data: &[u8]) -> Result<Vec<u8>> {
         return Err(Error::Media("still image bytes are not a PNG".into()));
     }
     Ok(data.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alpha_is_guessed_from_the_format_name() {
+        for f in ["rgba", "bgra", "argb", "abgr", "rgba64le", "yuva420p", "yuva444p10le", "gbrap", "gbrap16be", "ya8"] {
+            assert!(guess_alpha(f), "{f}");
+        }
+        for f in ["rgb24", "bgr0", "yuv420p", "yuvj420p", "gbrp", "gray", "nv12", "yuv444p10le"] {
+            assert!(!guess_alpha(f), "{f}");
+        }
+    }
 }

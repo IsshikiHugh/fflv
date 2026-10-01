@@ -181,6 +181,8 @@ pub struct Writer {
     closed: bool,
     broken: Option<String>,
     pool: rayon::ThreadPool,
+    /// threads of `pool`, shared by the libvpx encoders
+    threads: usize,
     pub report: Option<Report>,
     /// Test hook: the encoder of this layer fails.
     #[cfg(test)]
@@ -196,6 +198,9 @@ impl Writer {
         if width == 0 || height == 0 {
             return err(format!("size must be positive, got {width}x{height}"));
         }
+        if width > 16384 || height > 16384 {
+            return err(format!("size {width}x{height} is too large (at most 16384x16384)"));
+        }
         let gop = match opts.gop {
             Some(0) => return err("gop must be positive"),
             Some(g) => g,
@@ -204,9 +209,9 @@ impl Writer {
         let background = meta::check_background(&opts.background)?;
         let options = EncodeOptions::new(opts.crf, opts.speed)?;
         let threads =
-            opts.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(16));
+            opts.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(16)).max(1);
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads.max(1))
+            .num_threads(threads)
             .build()
             .map_err(|e| Error::Writer(format!("cannot start encoding threads: {e}")))?;
         let path = path.as_ref().to_path_buf();
@@ -228,6 +233,7 @@ impl Writer {
             closed: false,
             broken: None,
             pool,
+            threads,
             report: None,
             #[cfg(test)]
             fail_encode: None,
@@ -414,6 +420,16 @@ impl Writer {
                 s.offset = offset;
                 offset += s.png.len() as u64;
                 resources.extend_from_slice(&s.png);
+            }
+        }
+        // All plane streams encode at once (one task each): share the threads between them rather
+        // than giving every libvpx encoder all the cores. Only a speed hint, so a failure is ignored.
+        let streams: usize =
+            self.layers.iter().map(|l| if let Layer::Video(v) = l { v.encoder.streams() } else { 0 }).sum();
+        let per_stream = (self.threads / streams.max(1)).clamp(1, 8) as u32;
+        for l in &mut self.layers {
+            if let Layer::Video(v) = l {
+                let _ = v.encoder.set_threads(per_stream);
             }
         }
         let draft = encode_meta(&self.meta(0, false))?;
