@@ -43,7 +43,11 @@ impl Fps {
         if n <= 0 {
             return Err(format!("fps must be positive, got {s:?}"));
         }
-        Fps::new(n as u64, d as u64)
+        let g = gcd(n as u128, d as u128) as i128; // n, d > 0
+        match (u64::try_from(n / g), u64::try_from(d / g)) {
+            (Ok(n), Ok(d)) => Fps::new(n, d),
+            _ => Err(format!("fps {s:?} is out of range")),
+        }
     }
 
     pub fn as_f64(self) -> f64 {
@@ -61,11 +65,15 @@ impl fmt::Display for Fps {
     }
 }
 
-/// pts_us(f) = round(f * 1_000_000 * den / num), round half up.
+/// pts_us(f) = round(f * 1_000_000 * den / num), round half up. Saturates at i64::MAX (only
+/// reachable with absurd rates such as 1/4294967295 fps; the u128 math itself cannot overflow).
 pub fn pts_us(frame: u64, fps: Fps) -> i64 {
     let n = fps.num as u128;
-    ((2 * frame as u128 * 1_000_000 * fps.den as u128 + n) / (2 * n)) as i64
+    i64::try_from((2 * frame as u128 * 1_000_000 * fps.den as u128 + n) / (2 * n)).unwrap_or(i64::MAX)
 }
+
+/// Exponents beyond this are rejected: no i128 fraction has more than 39 digits anyway.
+const MAX_DECIMAL_EXP: u32 = 64;
 
 /// A decimal string as an exact fraction (numerator, denominator), e.g. "1.25" → (125, 100).
 /// Accepts an optional sign and exponent ("1e3", "2.5E-1").
@@ -75,6 +83,9 @@ pub fn parse_decimal(s: &str) -> Option<(i128, i128)> {
         Some(i) => (&s[..i], s[i + 1..].parse::<i32>().ok()?),
         None => (s, 0),
     };
+    if exp.unsigned_abs() > MAX_DECIMAL_EXP {
+        return None;
+    }
     let (neg, mant) = match mant.strip_prefix('-') {
         Some(m) => (true, m),
         None => (false, mant.strip_prefix('+').unwrap_or(mant)),
@@ -85,7 +96,10 @@ pub fn parse_decimal(s: &str) -> Option<(i128, i128)> {
     }
     let digits = format!("{int}{frac}");
     let mut num: i128 = digits.parse().ok()?;
-    let mut scale = (frac.len() as i32).checked_sub(exp)?;
+    if num == 0 {
+        return Some((0, 1)); // scaling would never overflow, so the loops below would not end early
+    }
+    let mut scale = i32::try_from(frac.len()).ok()?.checked_sub(exp)?;
     let mut den: i128 = 1;
     while scale > 0 {
         den = den.checked_mul(10)?;
@@ -161,6 +175,22 @@ mod tests {
         assert_eq!(Fps::parse("29.97").unwrap(), Fps { num: 2997, den: 100 });
         assert_eq!(Fps::parse("60/2").unwrap(), Fps { num: 30, den: 1 });
         assert!(Fps::parse("0/1").is_err() && Fps::parse("abc").is_err());
+        assert!(Fps::parse("18446744073709551617").is_err(), "must not wrap to 1/1");
+        assert_eq!(Fps::parse("29.970000000000000000000").unwrap(), Fps { num: 2997, den: 100 });
+    }
+
+    #[test]
+    fn decimals_with_extreme_exponents_end_quickly() {
+        assert_eq!(parse_decimal("0e2147483647"), None);
+        assert_eq!(parse_decimal("0.0e40"), Some((0, 1)));
+        assert_eq!(parse_decimal("1e65"), None);
+        assert_eq!(parse_decimal("1e-50"), None);
+        assert_eq!(parse_decimal("2.5E-1"), Some((25, 100)));
+    }
+
+    #[test]
+    fn pts_saturates() {
+        assert_eq!(pts_us(u32::MAX as u64, Fps::new(1, u32::MAX as u64).unwrap()), i64::MAX);
     }
 
     #[test]

@@ -84,7 +84,7 @@ ssh -L 8765:127.0.0.1:8765 user@server               # on your machine, then ope
 
 #### From source
 
-Needs Rust ≥ 1.83, libvpx and pkg-config (`brew install libvpx pkg-config` on macOS;
+Needs Rust ≥ 1.89, libvpx and pkg-config (`brew install libvpx pkg-config` on macOS;
 `apt install libvpx-dev pkg-config libclang-dev` on Debian/Ubuntu):
 
 ```bash

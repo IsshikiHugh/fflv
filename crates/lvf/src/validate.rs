@@ -285,7 +285,7 @@ fn check_meta(meta: &Value, rep: &mut Report, resources_size: u64, reader: &LvfR
                 rep.error("RES", format!("{tag}: resource must be {{offset, length, mime}} integers"), None);
                 continue;
             };
-            if off < 0 || len <= 0 || (off + len) as u64 > resources_size {
+            if off < 0 || len <= 0 || off.checked_add(len).is_none_or(|end| end as u64 > resources_size) {
                 rep.error(
                     "RES",
                     format!("{tag}: resource [{off}, +{len}) is outside the {resources_size}-byte resource region"),
@@ -567,8 +567,10 @@ fn run(reader: &LvfReader, rep: &mut Report, check_bitstream: bool) {
     let mut actual: Vec<(u64, u32, u8)> = Vec::new();
     let mut last_audio_pts: Option<i64> = None;
     let mut expect_next: u32 = 0;
-    let caus = reader.caus(None, None);
-    for (k, item) in caus.enumerate() {
+    // Frames are borrowed from the iterator's buffer: validation copies no payloads.
+    let mut caus = reader.caus(None, None);
+    for k in 0usize.. {
+        let Some(item) = caus.next_ref() else { break };
         let (offset, cau, _size) = match item {
             Ok(x) => x,
             Err(e) => {
@@ -611,7 +613,7 @@ fn run(reader: &LvfReader, rep: &mut Report, check_bitstream: bool) {
 
         // I2
         let got: Vec<usize> = cau.entries.iter().map(|e| e.layer_index as usize).collect();
-        let count = cau.video_entry_count.unwrap_or(cau.entries.len() as u16) as usize;
+        let count = cau.video_entry_count as usize;
         if count != video_layers.len() || got != video_layers {
             let want: BTreeSet<usize> = video_layers.iter().copied().collect();
             let have: BTreeSet<usize> = got.iter().copied().collect();
@@ -689,9 +691,9 @@ fn run(reader: &LvfReader, rep: &mut Report, check_bitstream: bool) {
             let flag_key = e.is_key();
             let (mut color_key, mut alpha_key) = (flag_key, flag_key);
             if check_bitstream {
-                color_key = check_packet(rep, f, li, "color", &e.color, flag_key, l);
+                color_key = check_packet(rep, f, li, "color", e.color, flag_key, l);
                 if !e.alpha.is_empty() {
-                    alpha_key = check_packet(rep, f, li, "alpha", &e.alpha, flag_key, l);
+                    alpha_key = check_packet(rep, f, li, "alpha", e.alpha, flag_key, l);
                 }
             }
             let planes_key = color_key && (e.alpha.is_empty() || alpha_key);
