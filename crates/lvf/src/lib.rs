@@ -14,7 +14,7 @@ pub mod timing;
 pub mod validate;
 pub mod vp9;
 
-pub use binary::{AudioPacket, Cau, FileHeader, IndexEntry, VideoEntry};
+pub use binary::{AudioPacket, AudioPacketRef, Cau, CauRef, FileHeader, IndexEntry, VideoEntry, VideoEntryRef};
 pub use container::{
     encode_meta, meta_capacity_for, rewrite_meta_in_place, rewrite_meta_with, temp_path_for, LvfReader, LvfWriter,
 };
