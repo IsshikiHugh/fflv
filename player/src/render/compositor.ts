@@ -11,6 +11,9 @@
  *    `alphaRangeFix` then optionally applies the same mapping (debug toggle).
  *  - Colors are straight (non-premultiplied); final alpha = alpha plane × layer opacity.
  *  - Frames padded to even size (content_size < coded size) are cropped back before scaling.
+ *  - Video textures are allocated once per picture size (texStorage2D) and then only overwritten
+ *    (texSubImage2D), instead of being reallocated by every upload.
+ *  - A lost WebGL context is rebuilt when the browser restores it: program, textures, stills.
  */
 import type { CompositeFrame, LumaPlane } from '../decode/frames';
 import { isActive, type BlendMode, type LvfMeta } from '../format/lvf';
@@ -64,30 +67,58 @@ void main() {
 
 const BLEND_IDS: Record<BlendMode, number> = { normal: 0, add: 1, multiply: 2, screen: 3 };
 
+/** A texture with immutable storage of one size and format. */
+interface SizedTexture {
+  tex: WebGLTexture;
+  width: number;
+  height: number;
+  format: number;
+}
+
 interface VideoTextures {
-  color: WebGLTexture;
-  alpha: WebGLTexture | null;
+  color: SizedTexture | null;
+  alpha: SizedTexture | null;
+  hasAlpha: boolean;
   /** Identity of the composite frame whose planes are in the textures. */
   source: CompositeFrame | null;
 }
+
+type StillLoader = (layerIndex: number) => Promise<Blob>;
 
 export class Compositor {
   readonly gl: WebGL2RenderingContext;
   alphaRangeFix = false;
   /** Testing aid: clear to this color instead of canvas.background. */
   backgroundOverride: [number, number, number] | null = null;
-  private readonly prog: WebGLProgram;
+  /** Called when a lost WebGL context has been rebuilt (and again when its stills are back). */
+  onRestored: () => void = () => {};
+  private prog!: WebGLProgram;
   private readonly u: Record<string, WebGLUniformLocation | null> = {};
   private meta: LvfMeta | null = null;
+  private stillLoader: StillLoader | null = null;
   private order: number[] = [];
   private video = new Map<number, VideoTextures>();
   private stills = new Map<number, WebGLTexture>();
   private bg: [number, number, number] = [0, 0, 0];
+  /** Bumped by release(): a load() or still re-upload that started earlier no longer applies. */
+  private loadToken = 0;
+  private lost = false;
 
   constructor(readonly canvas: HTMLCanvasElement) {
     const gl = canvas.getContext('webgl2', { alpha: false, antialias: false, premultipliedAlpha: false, preserveDrawingBuffer: false });
     if (!gl) throw new Error('WebGL2 is not available');
     this.gl = gl;
+    this.init();
+    canvas.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault(); // lets the browser restore the context
+      this.lost = true;
+    });
+    canvas.addEventListener('webglcontextrestored', () => this.restore());
+  }
+
+  /** Program, vertex data and fixed state; everything a context loss takes away except textures. */
+  private init(): void {
+    const gl = this.gl;
     this.prog = link(gl, VS, FS);
     for (const n of ['uRect', 'uCanvas', 'uUvScale', 'uColor', 'uAlpha', 'uAlphaSource', 'uAlphaRangeFix', 'uAlphaFull', 'uOpacity', 'uBlend']) {
       this.u[n] = gl.getUniformLocation(this.prog, n);
@@ -107,29 +138,81 @@ export class Compositor {
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
   }
 
-  /** Prepare for a file: canvas size, draw order, textures; decodes still images once. */
-  async load(meta: LvfMeta, stillBlob: (layerIndex: number) => Promise<Blob>): Promise<void> {
+  /**
+   * Prepare for a file: canvas size, draw order, textures; decodes still images once (all at the
+   * same time). Nothing changes until everything is ready, and a load overtaken by release() or a
+   * newer load() leaves no trace.
+   */
+  async load(meta: LvfMeta, stillBlob: StillLoader): Promise<void> {
     this.release();
+    const token = this.loadToken;
+    const bitmaps = await decodeStills(meta, stillBlob);
+    if (token !== this.loadToken) {
+      for (const b of bitmaps.values()) b.close();
+      return;
+    }
     this.meta = meta;
+    this.stillLoader = stillBlob;
     this.canvas.width = meta.canvas.width;
     this.canvas.height = meta.canvas.height;
     const hex = meta.canvas.background;
     this.bg = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255) as [number, number, number];
     this.order = zOrder(meta.layers);
+    this.createVideoSlots();
+    this.uploadStills(bitmaps);
+  }
+
+  /** Texture slots for the video layers; storage is allocated by the first upload. */
+  private createVideoSlots(): void {
+    for (const [i, L] of this.meta!.layers.entries()) {
+      if (L.kind === 'video') this.video.set(i, { color: null, alpha: null, hasAlpha: L.has_alpha, source: null });
+    }
+  }
+
+  /** Upload decoded stills (and close the bitmaps). While the context is lost, restore() redoes it. */
+  private uploadStills(bitmaps: Map<number, ImageBitmap>): void {
     const gl = this.gl;
-    for (const [i, L] of meta.layers.entries()) {
-      if (L.kind === 'video') {
-        this.video.set(i, { color: newTexture(gl), alpha: L.has_alpha ? newTexture(gl) : null, source: null });
-      } else {
-        const bmp = await createImageBitmap(await stillBlob(i), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+    for (const [i, bmp] of bitmaps) {
+      if (!this.lost) {
+        const old = this.stills.get(i); // a restore that overtook another one
+        if (old) gl.deleteTexture(old);
         const tex = newTexture(gl);
-        gl.bindTexture(gl.TEXTURE_2D, tex);
         gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
-        bmp.close();
         this.stills.set(i, tex);
       }
+      bmp.close();
     }
+  }
+
+  /**
+   * The context is back: every GL object is gone. Rebuild the program and the textures; video
+   * textures refill from the next draw, stills are decoded again.
+   */
+  private restore(): void {
+    this.lost = false;
+    this.init();
+    this.thumb = null;
+    this.video.clear();
+    this.stills.clear();
+    const meta = this.meta;
+    const loader = this.stillLoader;
+    if (meta && loader) {
+      this.createVideoSlots();
+      const token = this.loadToken;
+      decodeStills(meta, loader).then(
+        (bitmaps) => {
+          if (token !== this.loadToken || this.lost) {
+            for (const b of bitmaps.values()) b.close();
+            return;
+          }
+          this.uploadStills(bitmaps);
+          this.onRestored();
+        },
+        (e) => console.error('[lvf] could not restore still layers:', e),
+      );
+    }
+    this.onRestored();
   }
 
   /** Draw the layers in this order (layer indices, bottom first) instead of the file's z order. */
@@ -144,6 +227,7 @@ export class Compositor {
   draw(frame: CompositeFrame | null, states: LayerState[]): void {
     const gl = this.gl;
     const meta = this.meta;
+    if (this.lost) return;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.disable(gl.BLEND);
@@ -193,16 +277,16 @@ export class Compositor {
       const tex = this.video.get(li)!;
       if (!planes?.color) return null;
       if (tex.source !== frame) {
-        upload(gl, tex.color, planes.color, gl.BROWSER_DEFAULT_WEBGL);
-        if (tex.alpha && planes.alphaLuma) uploadLuma(gl, tex.alpha, planes.alphaLuma);
-        else if (tex.alpha && planes.alpha) upload(gl, tex.alpha, planes.alpha, gl.NONE);
+        tex.color = upload(gl, tex.color, planes.color, gl.BROWSER_DEFAULT_WEBGL);
+        if (tex.hasAlpha && planes.alphaLuma) tex.alpha = uploadLuma(gl, tex.alpha, planes.alphaLuma);
+        else if (tex.hasAlpha && planes.alpha) tex.alpha = upload(gl, tex.alpha, planes.alpha, gl.NONE);
         tex.source = frame;
       }
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, tex.color);
+      gl.bindTexture(gl.TEXTURE_2D, tex.color!.tex);
       if (tex.alpha) {
         gl.activeTexture(gl.TEXTURE1);
-        gl.bindTexture(gl.TEXTURE_2D, tex.alpha);
+        gl.bindTexture(gl.TEXTURE_2D, tex.alpha.tex);
         alphaSource = planes.alphaLuma ? 3 : 1;
       }
     } else {
@@ -226,7 +310,7 @@ export class Compositor {
     const gl = this.gl;
     const meta = this.meta;
     const result: (Uint8ClampedArray<ArrayBuffer> | null)[] = layers.map(() => null);
-    if (!meta || frame.isClosed || !layers.length) return result;
+    if (!meta || frame.isClosed || !layers.length || this.lost) return result;
     const perPass = Math.max(1, Math.floor((gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) / h));
     gl.useProgram(this.prog);
     gl.uniform2f(this.u.uCanvas, w, h);
@@ -309,9 +393,10 @@ export class Compositor {
 
   release(): void {
     const gl = this.gl;
+    this.loadToken++;
     for (const t of this.video.values()) {
-      gl.deleteTexture(t.color);
-      if (t.alpha) gl.deleteTexture(t.alpha);
+      if (t.color) gl.deleteTexture(t.color.tex);
+      if (t.alpha) gl.deleteTexture(t.alpha.tex);
     }
     for (const t of this.stills.values()) gl.deleteTexture(t);
     if (this.thumb) {
@@ -322,20 +407,53 @@ export class Compositor {
     this.video.clear();
     this.stills.clear();
     this.meta = null;
+    this.stillLoader = null;
   }
 }
 
-function upload(gl: WebGL2RenderingContext, tex: WebGLTexture, frame: VideoFrame, colorspace: number): void {
-  gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, colorspace);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+/** Decode the still layers' images, all at once; on failure none is left open. */
+async function decodeStills(meta: LvfMeta, stillBlob: StillLoader): Promise<Map<number, ImageBitmap>> {
+  const opts: ImageBitmapOptions = { premultiplyAlpha: 'none', colorSpaceConversion: 'none' };
+  const stills = meta.layers.flatMap((L, i) => (L.kind === 'still' ? [i] : []));
+  const results = await Promise.allSettled(stills.map(async (i) => createImageBitmap(await stillBlob(i), opts)));
+  const out = new Map<number, ImageBitmap>();
+  results.forEach((r, k) => r.status === 'fulfilled' && out.set(stills[k], r.value));
+  const failed = results.find((r) => r.status === 'rejected');
+  if (failed) {
+    for (const b of out.values()) b.close();
+    throw failed.reason;
+  }
+  return out;
 }
 
-function uploadLuma(gl: WebGL2RenderingContext, tex: WebGLTexture, luma: LumaPlane): void {
-  gl.bindTexture(gl.TEXTURE_2D, tex);
+/** `cur` if it has this size and format, else a new texture with that storage (`cur` is deleted). */
+function sized(gl: WebGL2RenderingContext, cur: SizedTexture | null, width: number, height: number, format: number): SizedTexture {
+  if (cur && cur.width === width && cur.height === height && cur.format === format) {
+    gl.bindTexture(gl.TEXTURE_2D, cur.tex);
+    return cur;
+  }
+  if (cur) gl.deleteTexture(cur.tex);
+  const tex = newTexture(gl);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, format, width, height);
+  return { tex, width, height, format };
+}
+
+/** Upload a VideoFrame at its display size (the size WebGL uploads it at); returns the texture used. */
+function upload(gl: WebGL2RenderingContext, cur: SizedTexture | null, frame: VideoFrame, colorspace: number): SizedTexture {
+  const t = sized(gl, cur, frame.displayWidth, frame.displayHeight, gl.RGBA8);
+  gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, colorspace);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+  return t;
+}
+
+function uploadLuma(gl: WebGL2RenderingContext, cur: SizedTexture | null, luma: LumaPlane): SizedTexture {
+  const t = sized(gl, cur, luma.width, luma.height, gl.R8);
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, luma.width, luma.height, 0, gl.RED, gl.UNSIGNED_BYTE, luma.data);
+  gl.pixelStorei(gl.UNPACK_ROW_LENGTH, luma.stride);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, luma.width, luma.height, gl.RED, gl.UNSIGNED_BYTE, luma.data, luma.offset);
+  gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0); // it would apply to VideoFrame uploads too
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+  return t;
 }
 
 function setBlend(gl: WebGL2RenderingContext, mode: BlendMode): void {

@@ -21,9 +21,14 @@ export function release(frame: VideoFrame | null | undefined): void {
   frameStats.live--;
 }
 
-/** Raw 8-bit luma of an alpha plane (limited range, as coded), copied out of its VideoFrame. */
+/**
+ * Raw 8-bit luma of an alpha plane (limited range, as coded), copied out of its VideoFrame. `data`
+ * holds the whole copied frame (a pooled buffer): row r of the luma starts at offset + r · stride.
+ */
 export interface LumaPlane {
   data: Uint8Array;
+  offset: number;
+  stride: number;
   width: number;
   height: number;
   timestamp: number;
@@ -43,25 +48,45 @@ export function hasCopyableLuma(frame: VideoFrame): boolean {
 }
 
 /**
+ * Buffers of released luma planes, reused for the next copies (copyTo writes every plane, so each
+ * copy needs a whole frame's allocationSize; reusing them avoids that much garbage per frame).
+ */
+const lumaPool: Uint8Array[] = [];
+const LUMA_POOL_MAX = 32;
+
+function takeBuffer(size: number): Uint8Array {
+  const i = lumaPool.findIndex((b) => b.byteLength === size);
+  return i >= 0 ? lumaPool.splice(i, 1)[0] : new Uint8Array(size);
+}
+
+function recycle(buf: Uint8Array): void {
+  if (lumaPool.length >= LUMA_POOL_MAX) lumaPool.shift();
+  lumaPool.push(buf);
+}
+
+/** Give a luma plane's buffer back to the pool; the plane must not be used afterwards. */
+export function releaseLuma(luma: LumaPlane | null): void {
+  if (luma) recycle(luma.data);
+}
+
+/**
  * Copy the Y plane of an 8-bit YUV frame. The browser's own YUV→RGB conversion is not exact enough
  * for alpha (Chrome/Edge map Y=235 to 253, not 255), so alpha is taken from the coded luma and
- * range-mapped in the shader instead.
+ * range-mapped in the shader instead. The rows stay at the frame's stride (the upload skips the
+ * padding with UNPACK_ROW_LENGTH).
  */
 export async function extractLuma(frame: VideoFrame): Promise<LumaPlane> {
   const rect = frame.visibleRect!;
-  const w = rect.width;
-  const h = rect.height;
-  const buf = new Uint8Array(frame.allocationSize());
-  const layout = await frame.copyTo(buf);
-  const { offset, stride } = layout[0];
-  let data: Uint8Array;
-  if (stride === w) {
-    data = buf.subarray(offset, offset + w * h);
-  } else {
-    data = new Uint8Array(w * h);
-    for (let r = 0; r < h; r++) data.set(buf.subarray(offset + r * stride, offset + r * stride + w), r * w);
+  const buf = takeBuffer(frame.allocationSize());
+  let layout: PlaneLayout[];
+  try {
+    layout = await frame.copyTo(buf);
+  } catch (e) {
+    recycle(buf);
+    throw e;
   }
-  return { data, width: w, height: h, timestamp: frame.timestamp };
+  const { offset, stride } = layout[0];
+  return { data: buf, offset, stride, width: rect.width, height: rect.height, timestamp: frame.timestamp };
 }
 
 /**
@@ -87,6 +112,7 @@ export class CompositeFrame {
     for (const p of this.planes.values()) {
       release(p.color);
       release(p.alpha);
+      releaseLuma(p.alphaLuma);
     }
     this.planes.clear();
   }
