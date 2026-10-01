@@ -18,6 +18,8 @@ import json
 import os
 from typing import Iterable
 
+import numpy as np
+
 from . import _fflv, _util
 from ._fflv import MetaError
 from .report import Report
@@ -36,8 +38,9 @@ def add_layer(path, id: str, source, *, output=None, start: int = 0, end: int | 
     """Append a video layer.
 
     `source`: a media file (scaled to `rect`, default the whole canvas), a sequence or iterator of
-    images, or a callable `frame -> image`. Images are H×W / H×W×3 / H×W×4 arrays (see
-    `fflv.Writer.write`); with arrays, `rect` defaults to the first image's size at (0, 0).
+    images (one array: a frame stack N×H×W or N×H×W×C), or a callable `frame -> image`. Images
+    are H×W / H×W×3 / H×W×4 arrays (see `fflv.Writer.write`); with arrays, `rect` defaults to the
+    first image's size at (0, 0).
     `alpha=None` picks alpha if the source has an alpha channel. Frames: [start, end), `end`
     defaults to the source length (sequences) or the end of the file.
     """
@@ -47,6 +50,8 @@ def add_layer(path, id: str, source, *, output=None, start: int = 0, end: int | 
     elif callable(source):
         images = (_util.as_uint8(source(f), id) for f in itertools.count(_util.uint(start, "start")))
     else:
+        if isinstance(source, np.ndarray):
+            _check_frame_stack(source, id)
         length = len(source) if hasattr(source, "__len__") else None
         images = (_util.as_uint8(img, id) for img in source)
     rep = _fflv.add_layer(os.fspath(path), id, media, images, length, _out(output), _util.uint(start, "start"),
@@ -54,6 +59,21 @@ def add_layer(path, id: str, source, *, output=None, start: int = 0, end: int | 
                           name, blend, _util.number(opacity, "opacity"), bool(visible), _util.uint(crf, "crf", 63), speed,
                           bool(check))
     return Report.from_json(rep)
+
+
+def _check_frame_stack(a: np.ndarray, id: str) -> None:
+    """An array source is a stack of frames: N×H×W (gray) or N×H×W×C (C = 1, 3 or 4).
+
+    N×H×W×C is unambiguous. With three dimensions, a last dimension of 1, 3 or 4 is taken for one
+    H×W×C image (a stack of gray frames 1, 3 or 4 pixels wide is not a likely thing to pass), which
+    would otherwise be read as H frames of W×C gray pixels.
+    """
+    one_image = MetaError(f"{id}: the source looks like one image (shape {a.shape}); give a list of images "
+                          f"or a frame stack N×H×W / N×H×W×C (e.g. [image] or image[None] for one frame)")
+    if a.ndim == 2 or (a.ndim == 3 and a.shape[2] in (1, 3, 4)):
+        raise one_image
+    if not (a.ndim == 3 or (a.ndim == 4 and a.shape[3] in (1, 3, 4))):
+        raise MetaError(f"{id}: a frame stack must be N×H×W or N×H×W×C (C = 1, 3 or 4), got shape {a.shape}")
 
 
 def add_still(path, id: str, image, *, output=None, rect=None, start: int = 0, end: int | None = None,

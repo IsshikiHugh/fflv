@@ -433,15 +433,9 @@ fn run(cli: Cli) -> Result<i32> {
             if layers.is_empty() && !audio {
                 return cli_err("nothing to remove: give layer ids/indices and/or --audio");
             }
-            let mut rep = None;
-            if !layers.is_empty() {
-                rep = edit::remove_layers(&file, &layers, output.as_deref(), true)?;
-            }
-            let target = output.as_deref().unwrap_or(&file);
-            if audio {
-                rep = edit::set_audio(target, None, None, "128k", 2, true)?;
-            }
-            report_edit(target, rep.as_ref())?;
+            // one rewrite of FILE (into OUT with -o) for the layers and the audio
+            let rep = edit::remove(&file, &layers, audio, output.as_deref(), true)?;
+            report_edit(output.as_deref().unwrap_or(&file), rep.as_ref())?;
             Ok(0)
         }
         Cmd::Set { file, layer, fields, output } => {

@@ -6,8 +6,11 @@
 //! `fflv set`, ...) the page reloads the file and keeps the current frame and layer settings.
 //!
 //! Each request opens the file once and takes the ETag, the size and the bytes from that one open
-//! file, so a response can never mix the ETag of one version with the bytes of another — even
-//! while the file is being replaced (writers rename a finished file over it, spec B.11).
+//! file, so a file replaced while a response is sent (writers rename a finished file over it,
+//! spec B.11) cannot mix into it: the response is all old file. An in-place metadata rewrite
+//! (`fflv set`) changes the open file itself, so a range read while one happens can mix bytes from
+//! before and after it; the rewrite changes the ETag (mtime), so the player's next request, sent
+//! with the old ETag in If-Match, gets 412 and the page reloads the file.
 //!
 //! The player can also export what it shows (its visible layers, at their opacities) to a video:
 //!   GET  /export              {"media", "formats"}: what this server can export
@@ -16,15 +19,22 @@
 //!   GET  /export/ID           {"state": running | done | failed | cancelled, "done", "total", "error"}
 //!   GET  /export/ID/file      the finished video, as a download named after the .lvd
 //!   POST /export/ID/cancel
-//! The video is rendered by [`render`] (like `fflv render`) into a temporary file, which is kept
-//! until the next export or until the server stops.
+//! POST requests must be sent as application/json (a page on another site cannot send that
+//! without a CORS preflight, which this server does not answer). The video is rendered by
+//! [`render`] (like `fflv render`) into a private temporary directory, and kept until the next
+//! export or until the server stops (a server killed by Ctrl+C leaves it behind).
+//!
+//! Listening on a loopback address (the default), only requests addressed to a loopback name are
+//! served (a page elsewhere must not reach the file through DNS rebinding). On another address,
+//! the Host must be an IP address, `localhost` or the name the server was bound to.
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -58,6 +68,16 @@ pub fn etag_of(meta: &std::fs::Metadata) -> String {
 
 fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("valid header")
+}
+
+/// A request header's value.
+fn request_header(req: &Request, name: &'static str) -> Option<String> {
+    req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string())
+}
+
+/// The mutex's data, also after a panic while it was held (the state it guards stays usable).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -110,8 +130,12 @@ pub struct ViewServer {
     /// Listening on a loopback address: only accept requests addressed to it (a page elsewhere
     /// must not reach the file through DNS rebinding).
     loopback_only: bool,
+    /// The host the server was bound to (lowercase), also accepted as a Host.
+    bound_host: String,
     /// The current (or last) export; shared with the thread that renders it.
     export: Arc<Mutex<Option<Export>>>,
+    /// Private directory of the export files, created with the first export.
+    export_dir: Mutex<Option<PathBuf>>,
 }
 
 /// Export ids, unique in the process (they also name the temporary files).
@@ -131,18 +155,32 @@ impl Running {
         }
     }
 
-    /// Stop the worker threads and wait for them.
+    /// Stop the worker threads; waits up to 2 s for requests in progress. A worker still busy
+    /// then (sending a large file to a slow client, say) is left to stop by itself once done.
     pub fn stop(self) {
         for _ in &self.workers {
             self.server.unblock();
         }
-        self.wait();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for w in self.workers {
+            while !w.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if w.is_finished() {
+                let _ = w.join();
+            }
+        }
     }
 }
 
 fn is_loopback_name(host: &str) -> bool {
     let ip = host.trim_start_matches('[').trim_end_matches(']');
     host == "localhost" || ip.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// An IP address (`[...]` for IPv6), not a DNS name.
+fn is_ip_address(host: &str) -> bool {
+    host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok()
 }
 
 /// The host name of a Host header value (without the port).
@@ -194,14 +232,24 @@ impl ViewServer {
             Error::View(format!("cannot listen on {host}, {port}: {}", last_error.borrow()))
         })?;
         let media_name = media.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let loopback_only = is_loopback_name(&host.to_ascii_lowercase());
+        let bound_host = host.to_ascii_lowercase();
+        let loopback_only = is_loopback_name(&bound_host);
+        if !loopback_only {
+            eprintln!(
+                "warning: listening on {host}, not a loopback address: anyone who can reach this machine there can \
+                 read {} and export from it (there is no authentication)",
+                media.display()
+            );
+        }
         Ok(ViewServer {
             server: Arc::new(server),
             media,
             media_name,
             quiet,
             loopback_only,
+            bound_host,
             export: Arc::new(Mutex::new(None)),
+            export_dir: Mutex::new(None),
         })
     }
 
@@ -248,12 +296,23 @@ impl ViewServer {
         if !self.quiet {
             eprintln!("{} {} {}", req.remote_addr().map_or("-".into(), |a| a.to_string()), req.method(), url);
         }
-        if self.loopback_only {
-            let host = req.headers().iter().find(|h| h.field.equiv("Host")).map(|h| h.value.as_str().to_string());
-            if !host.as_deref().map(|h| host_name(h).to_ascii_lowercase()).is_some_and(|h| is_loopback_name(&h)) {
-                let _ = req.respond(Response::empty(403));
-                return;
-            }
+        let host = request_header(&req, "Host").map(|h| host_name(&h).to_ascii_lowercase());
+        if !host.is_some_and(|h| self.host_allowed(&h)) {
+            let _ = req.respond(Response::empty(403));
+            return;
+        }
+        // Request bodies are refused before anything is read: only POST /export has one, of a
+        // stated length. (tiny_http has no socket timeouts, so a body being read ties up a
+        // worker; these limits keep what one request can hold small.)
+        let export_post = *req.method() == Method::Post && path == "/export";
+        let max_body = if export_post { MAX_EXPORT_REQUEST } else { MAX_OTHER_BODY };
+        if request_header(&req, "Transfer-Encoding").is_some() || (export_post && req.body_length().is_none()) {
+            let _ = req.respond(json_error(411, "send the request with a Content-Length"));
+            return;
+        }
+        if req.body_length().is_some_and(|n| n as u64 > max_body) {
+            let _ = req.respond(json_error(413, "request body too large"));
+            return;
         }
         if path == "/export" || path.starts_with("/export/") {
             let _ = self.handle_export(req, &path);
@@ -285,6 +344,15 @@ impl ViewServer {
         let _ = result;
     }
 
+    /// Whether a request addressed to `host` (a Host header's name, lowercase) is served.
+    fn host_allowed(&self, host: &str) -> bool {
+        if self.loopback_only {
+            return is_loopback_name(host);
+        }
+        // a DNS name other than the server's own could point anywhere (DNS rebinding)
+        is_ip_address(host) || host == "localhost" || host == self.bound_host
+    }
+
     fn not_found() -> Response<std::io::Empty> {
         Response::empty(404).with_header(header("Cache-Control", "no-store"))
     }
@@ -294,9 +362,7 @@ impl ViewServer {
         // ETag, size and bytes all come from this one open file.
         let meta = f.metadata()?;
         let (etag, size) = (etag_of(&meta), meta.len());
-        let get = |name: &'static str| {
-            req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string())
-        };
+        let get = |name: &'static str| request_header(&req, name);
         if let Some(want) = get("If-Match") {
             if want.trim() != "*" && want.trim() != etag {
                 return req.respond(media_headers(Response::empty(412), &etag));
@@ -328,8 +394,11 @@ impl ViewServer {
 
 impl Drop for ViewServer {
     fn drop(&mut self) {
-        if let Some(e) = self.export.lock().unwrap().take() {
+        if let Some(e) = lock(&self.export).take() {
             let _ = fs::remove_file(&e.path);
+        }
+        if let Some(dir) = lock(&self.export_dir).take() {
+            let _ = fs::remove_dir(&dir); // empty unless an export thread is still writing
         }
     }
 }
@@ -344,6 +413,9 @@ const EXPORT_FORMATS: &[(&str, &str)] =
 
 /// Largest export request accepted (it lists layer ids and opacities).
 const MAX_EXPORT_REQUEST: u64 = 1 << 20;
+
+/// Largest body accepted (and ignored) with other requests.
+const MAX_OTHER_BODY: u64 = 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ExportState {
@@ -424,6 +496,43 @@ fn json_error(status: u16, msg: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     json_response(status, &json!({ "error": msg }))
 }
 
+/// Sent as JSON: a page on another site cannot send that without a CORS preflight, which this
+/// server does not answer (so it cannot start or cancel exports).
+fn is_json(req: &Request) -> bool {
+    request_header(req, "Content-Type").is_some_and(|t| t.trim_start().starts_with("application/json"))
+}
+
+/// A new private directory (owner only, on Unix) with an unguessable name, for export files.
+fn private_temp_dir() -> std::io::Result<PathBuf> {
+    use std::hash::{BuildHasher, Hasher};
+    let mut last = None;
+    for _ in 0..16 {
+        // RandomState is seeded randomly (per process, then varied per instance)
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        h.write_u128(now);
+        h.write_u32(std::process::id());
+        let dir = std::env::temp_dir().join(format!("fflv-view-{:016x}", h.finish()));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.expect("tried"))
+}
+
+/// The message of a caught panic.
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default()
+}
+
 impl ViewServer {
     fn handle_export(&self, mut req: Request, path: &str) -> std::io::Result<()> {
         let rest: Vec<&str> = path.trim_start_matches("/export").trim_start_matches('/').split('/').collect();
@@ -436,15 +545,10 @@ impl ViewServer {
                 req.respond(json_response(200, &json!({ "media": media, "formats": formats })))
             }
             (Method::Post, [""]) => {
-                // Only JSON: a page on another site cannot send that without a CORS preflight,
-                // which this server does not answer.
-                let is_json = req
-                    .headers()
-                    .iter()
-                    .any(|h| h.field.equiv("Content-Type") && h.value.as_str().starts_with("application/json"));
-                if !is_json {
+                if !is_json(&req) {
                     return req.respond(json_error(415, "send the export request as application/json"));
                 }
+                // at most MAX_EXPORT_REQUEST bytes, the length stated (checked in handle())
                 let mut body = Vec::new();
                 req.as_reader().take(MAX_EXPORT_REQUEST + 1).read_to_end(&mut body)?;
                 if body.len() as u64 > MAX_EXPORT_REQUEST {
@@ -458,12 +562,15 @@ impl ViewServer {
                     Err(msg) => req.respond(json_error(400, &msg)),
                 }
             }
-            (Method::Get, [_]) => match self.export.lock().unwrap().as_ref().filter(|e| Some(e.id) == id) {
+            (Method::Get, [_]) => match lock(&self.export).as_ref().filter(|e| Some(e.id) == id) {
                 Some(e) => req.respond(json_response(200, &e.status())),
                 None => req.respond(json_error(404, "no such export")),
             },
             (Method::Post, [_, "cancel"]) => {
-                let status = self.export.lock().unwrap().as_mut().filter(|e| Some(e.id) == id).map(|e| {
+                if !is_json(&req) {
+                    return req.respond(json_error(415, "send the cancel request as application/json"));
+                }
+                let status = lock(&self.export).as_mut().filter(|e| Some(e.id) == id).map(|e| {
                     e.cancel = e.state == ExportState::Running;
                     e.status()
                 });
@@ -473,10 +580,7 @@ impl ViewServer {
                 }
             }
             (Method::Get | Method::Head, [_, "file"]) => {
-                let done = self
-                    .export
-                    .lock()
-                    .unwrap()
+                let done = lock(&self.export)
                     .as_ref()
                     .filter(|e| Some(e.id) == id && e.state == ExportState::Done)
                     .map(|e| (e.path.clone(), e.format));
@@ -499,7 +603,7 @@ impl ViewServer {
 
     /// Start rendering in the background; Err when another export is still running.
     fn start_export(&self, format: &'static str, opts: RenderOptions) -> std::result::Result<u64, String> {
-        let mut slot = self.export.lock().unwrap();
+        let mut slot = lock(&self.export);
         if slot.as_ref().is_some_and(|e| e.state == ExportState::Running) {
             return Err("an export is already running".into());
         }
@@ -507,7 +611,19 @@ impl ViewServer {
             let _ = fs::remove_file(&old.path);
         }
         let id = NEXT_EXPORT.fetch_add(1, Ordering::Relaxed);
-        let out = std::env::temp_dir().join(format!("fflv-export-{}-{id}.{format}", std::process::id()));
+        let out = {
+            let mut dir = lock(&self.export_dir);
+            if dir.is_none() {
+                *dir = Some(private_temp_dir().map_err(|e| format!("cannot create a temporary directory: {e}"))?);
+            }
+            dir.as_ref().expect("just set").join(format!("export-{id}.{format}"))
+        };
+        // claimed here (the name must not exist), then overwritten by the render
+        File::options()
+            .write(true)
+            .create_new(true)
+            .open(&out)
+            .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
         *slot = Some(Export {
             id,
             state: ExportState::Running,
@@ -521,7 +637,7 @@ impl ViewServer {
         let (jobs, media) = (self.export.clone(), self.media.clone());
         std::thread::spawn(move || {
             let mut progress = |done: u32, total: u32| -> Result<()> {
-                let mut slot = jobs.lock().unwrap();
+                let mut slot = lock(&jobs);
                 match slot.as_mut().filter(|e| e.id == id) {
                     Some(e) if !e.cancel => {
                         (e.done, e.total) = (done, total);
@@ -530,8 +646,12 @@ impl ViewServer {
                     _ => Err(Error::Output("export cancelled".into())),
                 }
             };
-            let result = render(&media, &out.to_string_lossy(), &opts, Some(&mut progress));
-            let mut slot = jobs.lock().unwrap();
+            // a panic must not leave the export "running" (refusing every later one) or its file
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                render(&media, &out.to_string_lossy(), &opts, Some(&mut progress))
+            }))
+            .unwrap_or_else(|p| Err(Error::Output(format!("the export failed: {}", panic_message(&*p)))));
+            let mut slot = lock(&jobs);
             let Some(e) = slot.as_mut().filter(|e| e.id == id) else {
                 let _ = fs::remove_file(&out);
                 return;
@@ -690,5 +810,22 @@ mod tests {
         assert_eq!(host_name("localhost"), "localhost");
         assert!(!is_loopback_name(host_name("evil.example.com:8765")));
         assert!(is_loopback_name(host_name("127.0.0.2:80")) && is_loopback_name(host_name("[::1]:80")));
+        assert!(is_ip_address(host_name("192.168.1.20:8765")) && is_ip_address(host_name("[fe80::1]:80")));
+        assert!(!is_ip_address(host_name("evil.example.com:8765")) && !is_ip_address("localhost"));
+    }
+
+    #[test]
+    fn private_dirs_and_panics() {
+        let (a, b) = (private_temp_dir().unwrap(), private_temp_dir().unwrap());
+        assert_ne!(a, b);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&a).unwrap().permissions().mode() & 0o077, 0);
+        }
+        fs::remove_dir(a).unwrap();
+        fs::remove_dir(b).unwrap();
+        let p = std::panic::catch_unwind(|| -> u8 { panic!("boom {}", 1) }).unwrap_err();
+        assert_eq!(panic_message(&*p), "boom 1");
     }
 }

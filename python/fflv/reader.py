@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Iterable, Iterator
@@ -74,9 +75,15 @@ class Reader:
         self.size = (m["canvas"]["width"], m["canvas"]["height"])
         self.background: str = m["canvas"]["background"]
         self.layers = [_layer_info(i, L) for i, L in enumerate(m["layers"])]
+        # frame(): the decoding of the last call, (selection, next frame, iterator), so that reading
+        # consecutive frames continues it instead of starting over from a random-access point
+        self._next_frames = None
+        self._next_frames_lock = threading.Lock()
 
     def close(self) -> None:
         """Close the file. Iterators already started keep their own handle until they are done."""
+        with self._next_frames_lock:
+            self._next_frames = None
         self._r.close()
 
     def __enter__(self) -> "Reader":
@@ -144,8 +151,27 @@ class Reader:
 
     def frame(self, index: int, layers: Iterable | None = None, *, hide: Iterable | None = None,
               transparent: bool = False) -> np.ndarray:
+        """Composite frame `index` (see `frames`). Reading frames one after another with the same
+        layers continues one decoding instead of starting over from a random-access point."""
         index = _util.uint(index, "index")
-        return next(self.frames(index, index + 1, layers=layers, hide=hide, transparent=transparent))[1]
+        keys = None if layers is None else tuple(_util.keys(layers))
+        hidden = () if hide is None else tuple(_util.keys(hide, "hide"))
+        selection = (keys, hidden, bool(transparent))
+        with self._next_frames_lock:
+            cached, self._next_frames = self._next_frames, None
+        it = None
+        if cached is not None and cached[0] == selection and cached[1] == index:
+            it = cached[2]
+            item = next(it, None)
+            if item is None or item[0] != index:
+                it = None
+        if it is None:
+            it = iter(self._r.frames(index, None, None if keys is None else list(keys), list(hidden),
+                                     selection[2]))
+            item = next(it)
+        with self._next_frames_lock:
+            self._next_frames = (selection, index + 1, it)
+        return item[1]
 
     def layer_frames(self, key, start: int | None = None, end: int | None = None) -> Iterator[tuple[int, np.ndarray]]:
         """A layer's own pixels as RGBA uint8 (content size), for the frames where it is active."""

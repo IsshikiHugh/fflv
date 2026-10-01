@@ -11,8 +11,16 @@
 //! points, so random access stays the same. `set_layer` rewrites the metadata in place — instant,
 //! whatever the file size — when it fits the space reserved after the metadata (it always does
 //! for ordinary edits).
+//!
+//! Edits of one file are serialized: a rewrite holds an exclusive lock on the source file from
+//! the moment it opens it until the result is published, and lvf's in-place metadata rewrite
+//! takes the same lock. A rewritten file keeps the source's permissions; editing in place through
+//! a symbolic link rewrites the file it points to and keeps the link.
 
-use std::path::Path;
+use std::cell::RefCell;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use lvf::meta::{self, Layer, Rect, VideoLayerSpec, Z};
 use lvf::{encode_meta, pts_us, publish, rewrite_meta_with, temp_path_for, Cau, LvfReader, Meta, Report, VideoEntry};
@@ -49,8 +57,92 @@ pub enum AudioEdit {
     Replace(AudioTrack),
 }
 
+thread_local! {
+    /// See [`with_interrupt_check`].
+    static INTERRUPT_CHECK: RefCell<Option<Box<dyn FnMut() -> Result<()>>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with `check` called every ~100 ms by the rewrites it makes on this thread (between
+/// frames); an error from `check` stops the rewrite (nothing is published) and is returned. For
+/// callers that must stay interruptible, like the Python bindings (Ctrl+C).
+pub fn with_interrupt_check<R>(check: impl FnMut() -> Result<()> + 'static, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Box<dyn FnMut() -> Result<()>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            INTERRUPT_CHECK.with(|c| *c.borrow_mut() = previous);
+        }
+    }
+    let previous = INTERRUPT_CHECK.with(|c| c.borrow_mut().replace(Box::new(check)));
+    let _restore = Restore(previous);
+    f()
+}
+
+fn interrupt_check() -> Result<()> {
+    INTERRUPT_CHECK.with(|c| match c.borrow_mut().as_mut() {
+        Some(check) => check(),
+        None => Ok(()),
+    })
+}
+
+/// Open `path` and take an exclusive lock on it (waiting for other edits of it to finish). When
+/// the file was replaced (renamed over) while waiting, the new one is locked instead. Unix only:
+/// Windows locks are mandatory, so there the lock would also stop the edit's own reader (and the
+/// viewer) from reading the file; elsewhere edits run unlocked.
+fn lock_file(path: &Path) -> Result<File> {
+    // (read-only, unlike lvf::container::open_locked: the source of an edit written elsewhere
+    // need not be writable)
+    for _ in 0..100 {
+        let f = File::open(path)?;
+        if cfg!(not(unix)) {
+            return Ok(f);
+        }
+        match f.lock() {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => return Ok(f),
+            Err(e) => return Err(e.into()),
+        }
+        if is_file_at(&f, path) {
+            return Ok(f);
+        }
+    }
+    err(format!("{} keeps being replaced", path.display()))
+}
+
+/// Whether the open file `f` is still the one `path` names.
+#[cfg(unix)]
+fn is_file_at(f: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (f.metadata(), fs::metadata(path)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        // gone: the next open reports it
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_file_at(_f: &File, _path: &Path) -> bool {
+    true
+}
+
+/// Where a rewrite of `src` into `dst` is published: `dst`, or, when `dst` is a symbolic link to
+/// `src` itself (an in-place edit), the file it points to — the link stays a link.
+fn publish_target(src: &Path, dst: &Path) -> PathBuf {
+    let is_link = fs::symlink_metadata(dst).is_ok_and(|m| m.file_type().is_symlink());
+    if is_link && same_file(src, dst) {
+        if let Ok(real) = fs::canonicalize(dst) {
+            return real;
+        }
+    }
+    dst.to_path_buf()
+}
+
 /// Rewrite `src` into `dst` (default: in place): drop layers, append layers, replace audio,
 /// patch the metadata. Packets of kept layers are copied as they are.
+///
+/// `src` stays locked (exclusively, see [`lock_file`]) until the result is published. When the
+/// result replaces `src`, the lock is released on the replaced file: an edit that was waiting for
+/// it notices the replacement and locks the new file.
 pub fn remux(
     src: &Path,
     dst: Option<&Path>,
@@ -61,8 +153,9 @@ pub fn remux(
     meta_patch: Option<&dyn Fn(&mut Meta) -> Result<()>>,
     check: bool,
 ) -> Result<Option<Report>> {
-    let dst = dst.unwrap_or(src);
-    let tmp = temp_path_for(dst);
+    let lock = lock_file(src)?;
+    let dst = publish_target(src, dst.unwrap_or(src));
+    let tmp = temp_path_for(&dst);
     let r = LvfReader::open(src)?;
     let mut meta = r.meta()?;
     let fps = meta.fps();
@@ -93,20 +186,20 @@ pub fn remux(
         if l.kind != lvf::Kind::Still {
             continue;
         }
-        let data = match png {
-            Some(p) => p.clone(),
+        let offset = resources.len() as u64;
+        match png {
+            Some(p) => resources.extend_from_slice(p),
             None => {
                 let res =
                     l.resource.as_ref().ok_or_else(|| Error::Format(format!("still {:?} has no resource", l.id)))?;
-                r.resource(res.offset, res.length)?
+                resources.extend_from_slice(&r.resource(res.offset, res.length)?);
             }
-        };
+        }
         let res =
             l.resource.get_or_insert_with(|| lvf::meta::Resource { offset: 0, length: 0, mime: "image/png".into() });
-        res.offset = resources.len() as u64;
-        res.length = data.len() as u64;
+        res.offset = offset;
+        res.length = resources.len() as u64 - offset;
         res.mime = "image/png".into();
-        resources.extend_from_slice(&data);
     }
 
     let keep_audio = matches!(audio, AudioEdit::Keep);
@@ -136,7 +229,12 @@ pub fn remux(
     let result = (|| -> Result<()> {
         w.begin(&encode_meta(&meta)?, &resources, None)?;
         let mut ai = 0;
+        let mut last_check = Instant::now();
         for item in r.caus(None, None) {
+            if last_check.elapsed() >= Duration::from_millis(100) {
+                interrupt_check()?;
+                last_check = Instant::now();
+            }
             let (_, cau, _) = item?;
             let f = cau.frame_index;
             let mut entries: Vec<VideoEntry> = cau
@@ -184,10 +282,16 @@ pub fn remux(
         return Err(e.into());
     }
     drop(r);
-    publish(&tmp, dst, check).map_err(|e| match Error::from(e) {
+    // like the file it replaces (best effort: not every file system has permissions)
+    if let Ok(m) = fs::metadata(src) {
+        let _ = fs::set_permissions(&tmp, m.permissions());
+    }
+    let published = publish(&tmp, &dst, check).map_err(|e| match Error::from(e) {
         e @ Error::Invalid { .. } => Error::Edit(e.to_string()),
         e => e,
-    })
+    });
+    drop(lock);
+    published
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -377,12 +481,21 @@ pub fn add_still(path: &Path, id: &str, png: Vec<u8>, o: &AddOptions) -> Result<
 }
 
 pub fn remove_layers(path: &Path, keys: &[String], output: Option<&Path>, check: bool) -> Result<Option<Report>> {
-    let (meta, _) = file_info(path)?;
-    let remove: Vec<usize> = keys.iter().map(|k| meta.resolve_layer(k)).collect::<std::result::Result<_, _>>()?;
-    if remove.is_empty() {
+    if keys.is_empty() {
         return err("no layers given");
     }
-    remux(path, output, &remove, vec![], vec![], AudioEdit::Keep, None, check)
+    remove(path, keys, false, output, check)
+}
+
+/// Remove layers and/or (`audio`) the audio track, in one rewrite.
+pub fn remove(path: &Path, keys: &[String], audio: bool, output: Option<&Path>, check: bool) -> Result<Option<Report>> {
+    if keys.is_empty() && !audio {
+        return err("nothing to remove");
+    }
+    let (meta, _) = file_info(path)?;
+    let remove: Vec<usize> = keys.iter().map(|k| meta.resolve_layer(k)).collect::<std::result::Result<_, _>>()?;
+    let audio = if audio { AudioEdit::Remove } else { AudioEdit::Keep };
+    remux(path, output, &remove, vec![], vec![], audio, None, check)
 }
 
 /// Replace the audio track with `source` (any file FFmpeg reads), or remove it (None).

@@ -104,3 +104,16 @@ def test_a_raising_progress_callback_stops_the_render(src, tmp_path):
     with fflv.open(src) as r:
         with pytest.raises(fflv.MetaError):
             r.frame(-1)
+
+
+def test_frame_by_frame_matches_frames(src):
+    """frame(i) reuses the decoding of frame(i - 1) (same selection); any order gives the same pixels."""
+    with fflv.open(src) as r:
+        want = dict(r.frames())
+        for order in (range(N), [5, 6, 7, 2, 3, 11, 0, 1]):
+            for i in order:
+                assert np.array_equal(r.frame(i), want[i]), i
+        assert r.frame(3, transparent=True).shape == (H, W, 4) and r.frame(4).shape == (H, W, 3)
+        assert r.frame(5, layers=["hidden"])[2, 2, 0] == 255 and r.frame(6)[2, 2, 0] == 60
+        with pytest.raises(fflv.DecodeError, match="outside"):
+            r.frame(N)
