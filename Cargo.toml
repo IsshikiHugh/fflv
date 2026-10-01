@@ -20,6 +20,9 @@ serde_json = { version = "1", features = ["preserve_order"] }
 too_many_arguments = "allow"
 type_complexity = "allow"
 large_enum_variant = "allow"
+# Pixel loops use chunks_exact with per-channel-count constants, some derived from const generics
+# (`2 * C`), which `as_chunks` cannot take; both compile to the same code.
+chunks_exact_to_as_chunks = "allow"
 
 [profile.release]
 lto = "thin"
