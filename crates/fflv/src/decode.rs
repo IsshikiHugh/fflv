@@ -187,6 +187,8 @@ impl Reader {
             .iter()
             .map(|&i| {
                 let l = &self.meta.layers[i];
+                let (cw, ch) = l.coded_size();
+                check_side(&format!("layer {:?} coded", l.id), cw, ch)?;
                 let color = Decoder::new(threads, &format!("layer {:?} color", l.id))?;
                 let alpha =
                     if l.has_alpha() { Some(Decoder::new(threads, &format!("layer {:?} alpha", l.id))?) } else { None };
@@ -233,6 +235,7 @@ impl Reader {
         let videos: Vec<usize> = shown.iter().copied().filter(|&i| self.meta.layers[i].is_video()).collect();
         let background = if transparent { None } else { Some(parse_color(&self.meta.canvas.background)?) };
         let (w, h) = self.size();
+        check_side("canvas", w, h)?;
         Ok(Frames {
             decoding: self.decode(start, end, &videos)?,
             draw,
@@ -269,23 +272,33 @@ impl Reader {
 }
 
 /// Largest canvas / coded width or height decoding accepts (the compositing canvas takes 16 bytes
-/// per pixel).
+/// per pixel). Checked only when frames are decoded or composited, so a file beyond it still
+/// opens (metadata, stills, audio).
 const MAX_SIDE: u32 = 16384;
 
 /// What decoding relies on in the metadata (the validator checks much more).
 fn check_layers(meta: &Meta) -> Result<()> {
     let (w, h) = (meta.canvas.width, meta.canvas.height);
-    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
-        return Err(Error::Decode(format!("unsupported canvas size {w}x{h} (at most {MAX_SIDE}x{MAX_SIDE})")));
+    if w == 0 || h == 0 {
+        return Err(Error::Decode(format!("bad canvas size {w}x{h} (run `fflv check`)")));
     }
     for l in meta.layers.iter().filter(|l| l.is_video()) {
         let ((cw, ch), (w, h)) = (l.coded_size(), l.content_size());
-        if cw == 0 || ch == 0 || cw > MAX_SIDE || ch > MAX_SIDE || w == 0 || h == 0 || w > cw || h > ch {
+        if cw == 0 || ch == 0 || w == 0 || h == 0 || w > cw || h > ch {
             return Err(Error::Decode(format!(
                 "layer {:?}: bad coded size {cw}x{ch} / content size {w}x{h} (run `fflv check`)",
                 l.id
             )));
         }
+    }
+    Ok(())
+}
+
+fn check_side(what: &str, w: u32, h: u32) -> Result<()> {
+    if w > MAX_SIDE || h > MAX_SIDE {
+        return Err(Error::Decode(format!(
+            "{what} size {w}x{h} is too large to decode (at most {MAX_SIDE}x{MAX_SIDE})"
+        )));
     }
     Ok(())
 }

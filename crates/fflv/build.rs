@@ -2,9 +2,10 @@
 //! (src/view.rs); this script fills that directory. `FFLV_PLAYER` chooses how:
 //!
 //! - unset or `auto`: in a checkout (player/ present) with npm on PATH, build the player whenever
-//!   its sources change (`npm ci` first if player/node_modules is missing). Without npm, use
-//!   crates/fflv/viewer when it holds a build (a source package ships one; `npm run build` in
-//!   player/ writes one); otherwise build fflv without the player (`fflv view` then says so).
+//!   its sources change (`npm ci` first when player/node_modules is missing or older than
+//!   package-lock.json). Without npm, use crates/fflv/viewer when it holds a build (a source
+//!   package ships one; `npm run build` in player/ writes one); otherwise build fflv without the
+//!   player (`fflv view` then says so).
 //! - `build`: like `auto`, but npm is required (CI: never build without the player by accident).
 //! - `prebuilt`: use crates/fflv/viewer as it is; it must hold a build (release builds, which
 //!   build the player once and pass it to every platform).
@@ -77,9 +78,14 @@ fn auto(player: &Path, prebuilt: &Path, out: &Path, required: bool) -> Result<()
     Ok(())
 }
 
-/// `vite build` into `out` (`npm ci` first when the dependencies are not installed).
+/// `vite build` into `out` (`npm ci` first when the dependencies are not installed, or were
+/// installed from another package-lock.json).
 fn build(npm: &str, player: &Path, out: &Path) -> Result<(), String> {
-    if !player.join("node_modules").is_dir() {
+    // npm writes node_modules/.package-lock.json on every install: older than package-lock.json
+    // means the lock file changed since (e.g. a pulled dependency update)
+    let modified = |p: &str| fs::metadata(player.join(p)).and_then(|m| m.modified()).ok();
+    let installed = modified("node_modules/.package-lock.json");
+    if installed.is_none() || modified("package-lock.json") > installed {
         run(Command::new(npm).arg("ci").current_dir(player), "npm ci")?;
     }
     let mut vite = Command::new(npm);

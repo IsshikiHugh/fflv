@@ -140,10 +140,13 @@ fn publish_target(src: &Path, dst: &Path) -> PathBuf {
 /// Rewrite `src` into `dst` (default: in place): drop layers, append layers, replace audio,
 /// patch the metadata. Packets of kept layers are copied as they are.
 ///
-/// `src` stays locked (exclusively, see [`lock_file`]) until the result is published. When the
-/// result replaces `src`, the lock is released on the replaced file: an edit that was waiting for
-/// it notices the replacement and locks the new file.
+/// `lock` is `src` locked by [`lock_file`], taken by the caller before it read anything it plans
+/// the edit from (layer indices, ids, random-access points), so concurrent edits never plan
+/// against a file that is replaced underneath them. It is held until the result is published.
+/// When the result replaces `src`, the lock is released on the replaced file: an edit that was
+/// waiting for it notices the replacement and locks the new file.
 pub fn remux(
+    lock: File,
     src: &Path,
     dst: Option<&Path>,
     remove: &[usize],
@@ -153,7 +156,6 @@ pub fn remux(
     meta_patch: Option<&dyn Fn(&mut Meta) -> Result<()>>,
     check: bool,
 ) -> Result<Option<Report>> {
-    let lock = lock_file(src)?;
     let dst = publish_target(src, dst.unwrap_or(src));
     let tmp = temp_path_for(&dst);
     let r = LvfReader::open(src)?;
@@ -368,6 +370,7 @@ impl Default for AddOptions {
 
 /// Append a video layer; key frames go exactly on the file's random-access points.
 pub fn add_layer(path: &Path, id: &str, source: Source, o: &AddOptions) -> Result<Option<Report>> {
+    let lock = lock_file(path)?;
     let (meta, raps) = file_info(path)?;
     let taken: Vec<&str> = meta.layers.iter().map(|l| l.id.as_str()).collect();
     let id = meta::check_id(id, &taken)?;
@@ -436,6 +439,7 @@ pub fn add_layer(path: &Path, id: &str, source: Source, o: &AddOptions) -> Resul
         Ok((c, a, key))
     });
     remux(
+        lock,
         path,
         o.output.as_deref(),
         &[],
@@ -449,6 +453,7 @@ pub fn add_layer(path: &Path, id: &str, source: Source, o: &AddOptions) -> Resul
 
 /// Append a still layer (PNG bytes) shown in frames [start, end).
 pub fn add_still(path: &Path, id: &str, png: Vec<u8>, o: &AddOptions) -> Result<Option<Report>> {
+    let lock = lock_file(path)?;
     let (meta, _) = file_info(path)?;
     let taken: Vec<&str> = meta.layers.iter().map(|l| l.id.as_str()).collect();
     let id = meta::check_id(id, &taken)?;
@@ -477,7 +482,17 @@ pub fn add_still(path: &Path, id: &str, png: Vec<u8>, o: &AddOptions) -> Result<
         meta::check_opacity(o.opacity)?,
         o.visible,
     );
-    remux(path, o.output.as_deref(), &[], vec![], vec![NewStill { meta: layer, png }], AudioEdit::Keep, None, o.check)
+    remux(
+        lock,
+        path,
+        o.output.as_deref(),
+        &[],
+        vec![],
+        vec![NewStill { meta: layer, png }],
+        AudioEdit::Keep,
+        None,
+        o.check,
+    )
 }
 
 pub fn remove_layers(path: &Path, keys: &[String], output: Option<&Path>, check: bool) -> Result<Option<Report>> {
@@ -492,10 +507,11 @@ pub fn remove(path: &Path, keys: &[String], audio: bool, output: Option<&Path>, 
     if keys.is_empty() && !audio {
         return err("nothing to remove");
     }
+    let lock = lock_file(path)?;
     let (meta, _) = file_info(path)?;
     let remove: Vec<usize> = keys.iter().map(|k| meta.resolve_layer(k)).collect::<std::result::Result<_, _>>()?;
     let audio = if audio { AudioEdit::Remove } else { AudioEdit::Keep };
-    remux(path, output, &remove, vec![], vec![], audio, None, check)
+    remux(lock, path, output, &remove, vec![], vec![], audio, None, check)
 }
 
 /// Replace the audio track with `source` (any file FFmpeg reads), or remove it (None).
@@ -507,13 +523,14 @@ pub fn set_audio(
     channels: u32,
     check: bool,
 ) -> Result<Option<Report>> {
+    let lock = lock_file(path)?;
     let Some(src) = source else {
-        return remux(path, output, &[], vec![], vec![], AudioEdit::Remove, None, check);
+        return remux(lock, path, output, &[], vec![], vec![], AudioEdit::Remove, None, check);
     };
     let (meta, _) = file_info(path)?;
     let seconds = meta.frame_count as f64 * meta.fps.den as f64 / meta.fps.num as f64;
     let track = encode_audio(src, Some(seconds), bitrate, channels)?;
-    remux(path, output, &[], vec![], vec![], AudioEdit::Replace(track), None, check)
+    remux(lock, path, output, &[], vec![], vec![], AudioEdit::Replace(track), None, check)
 }
 
 /// Validate and apply field changes (id, name, z, rect, blend, opacity, visible) to one layer.
@@ -535,7 +552,7 @@ pub fn set_layer(path: &Path, key: &str, fields: &[(String, Value)], output: Opt
     };
     if let Some(out) = output.filter(|out| !same_file(path, out)) {
         // A new file: written like every other edit (temporary file, validated, renamed).
-        remux(path, Some(out), &[], vec![], vec![], AudioEdit::Keep, Some(&patch), true)?;
+        remux(lock_file(path)?, path, Some(out), &[], vec![], vec![], AudioEdit::Keep, Some(&patch), true)?;
         return Ok(false);
     }
     // In place: the metadata is read, edited and rewritten through one open file.
@@ -559,7 +576,7 @@ pub fn set_layer(path: &Path, key: &str, fields: &[(String, Value)], output: Opt
     }
     // No room beside the current metadata: rewrite the file, applying the edits to the metadata
     // remux() builds (its still-resource offsets are recomputed for the rewritten resources).
-    remux(path, None, &[], vec![], vec![], AudioEdit::Keep, Some(&patch), true)?;
+    remux(lock_file(path)?, path, None, &[], vec![], vec![], AudioEdit::Keep, Some(&patch), true)?;
     Ok(false)
 }
 

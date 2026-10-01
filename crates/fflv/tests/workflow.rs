@@ -511,3 +511,44 @@ fn corrupt_devtool_reports_every_variant() {
     let out = ok(&["corrupt", packed().path.to_str().unwrap(), "--out", d.to_str().unwrap(), "--check"]);
     assert!(out.contains("13/13 broken files reported as expected"), "{out}");
 }
+
+#[test]
+fn a_canvas_too_large_to_composite_still_opens() {
+    let p = copy_of("huge-canvas");
+    let done = lvf::rewrite_meta_with(&p, |current| {
+        let mut m: Value = serde_json::from_slice(current).unwrap();
+        m["canvas"]["width"] = 20000.into();
+        Ok(serde_json::to_vec(&m).unwrap())
+    })
+    .unwrap();
+    assert!(done);
+    let r = Reader::open(&p).unwrap();
+    assert_eq!(r.size().0, 20000);
+    let e = r.frames(0, Some(1), None, &[], false).err().expect("compositing a 20000-wide canvas");
+    assert!(e.to_string().contains("too large"), "{e}");
+}
+
+/// An edit waiting for another edit of the same file plans against the file it finally locks,
+/// not the one it saw before waiting (here: layer indices shift while `rm` waits).
+#[cfg(unix)]
+#[test]
+fn a_waiting_edit_plans_against_the_replaced_file() {
+    let path = copy_of("wait");
+    let ids = |p: &Path| Reader::open(p).unwrap().layers().iter().map(|l| l.id.clone()).collect::<Vec<_>>();
+    let before = ids(&path);
+    let (first, last) = (before[0].clone(), before[before.len() - 1].clone());
+    // the replacement: the first layer gone, so every other layer's index moves down by one
+    let next = path.with_file_name("next.lvd");
+    edit::remove_layers(&path, std::slice::from_ref(&first), Some(&next), true).unwrap();
+
+    let held = std::fs::File::open(&path).unwrap();
+    held.lock().unwrap();
+    let (p, l) = (path.clone(), last.clone());
+    let waiting = std::thread::spawn(move || edit::remove_layers(&p, &[l], None, true).map(|_| ()));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::fs::rename(&next, &path).unwrap();
+    drop(held);
+    waiting.join().unwrap().unwrap();
+    let expected: Vec<String> = before.into_iter().filter(|id| *id != first && *id != last).collect();
+    assert_eq!(ids(&path), expected);
+}
