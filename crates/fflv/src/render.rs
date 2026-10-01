@@ -264,7 +264,7 @@ impl FfmpegSink {
 /// Pad to even width/height by repeating the last column / row.
 fn pad_even(img: &Image) -> Option<Image> {
     let (w, h, c) = (img.width as usize, img.height as usize, img.channels as usize);
-    if w % 2 == 0 && h % 2 == 0 {
+    if w.is_multiple_of(2) && h.is_multiple_of(2) {
         return None;
     }
     let (pw, ph) = (w + w % 2, h + h % 2);

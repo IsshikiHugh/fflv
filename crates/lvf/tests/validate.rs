@@ -19,7 +19,7 @@ struct Bits(Vec<u8>, usize);
 impl Bits {
     fn put(&mut self, v: u32, n: u32) {
         for i in (0..n).rev() {
-            if self.1 % 8 == 0 {
+            if self.1.is_multiple_of(8) {
                 self.0.push(0);
             }
             let bit = ((v >> i) & 1) as u8;
@@ -120,7 +120,7 @@ fn layout() -> Layout {
                 entries.push(VideoEntry::empty(i as u16));
                 continue;
             }
-            let key = f == l.start_frame || f % GOP == 0;
+            let key = f == l.start_frame || f.is_multiple_of(GOP);
             rap &= key;
             let (w, h) = l.coded_size();
             let color = vp9(key, w, h, l.lossless, false);

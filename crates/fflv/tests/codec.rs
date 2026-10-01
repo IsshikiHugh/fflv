@@ -44,7 +44,7 @@ fn lossless_layers_round_trip_exactly_even_at_odd_sizes() {
         let (mut dc, mut da) = (Decoder::new(1, "c").unwrap(), Decoder::new(1, "a").unwrap());
         for f in 0..6 {
             let img = pattern(w, h, f);
-            let (c, a) = enc.encode(img.view(), f % 4 == 0).unwrap();
+            let (c, a) = enc.encode(img.view(), f.is_multiple_of(4)).unwrap();
             let info = inspect_packet(&c).unwrap();
             assert_eq!(info.frames[0].profile, 1);
             let got = decode_rgba(&mut dc, &mut da, &c, &a, w, h, true);

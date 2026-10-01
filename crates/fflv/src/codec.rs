@@ -245,7 +245,7 @@ impl Encoder {
         if width == 0 || height == 0 || width > 16384 || height > 16384 {
             return Err(fail(format!("unsupported size {width}x{height}")));
         }
-        if format == PlaneFormat::I420 && (width % 2 != 0 || height % 2 != 0) {
+        if format == PlaneFormat::I420 && (!width.is_multiple_of(2) || !height.is_multiple_of(2)) {
             return Err(fail(format!("4:2:0 needs an even size, got {width}x{height}")));
         }
         if signal == Signal::Rgb && format != PlaneFormat::I444 {

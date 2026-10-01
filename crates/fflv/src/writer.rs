@@ -537,7 +537,7 @@ impl Writer {
             .enumerate()
             .filter_map(|(i, l)| match l {
                 Layer::Video(v) if v.start.is_some() && v.end.is_none() => {
-                    let key = Some(f) == v.start || f % gop == 0;
+                    let key = Some(f) == v.start || f.is_multiple_of(gop);
                     Some((i, v.as_mut(), key))
                 }
                 _ => None,
