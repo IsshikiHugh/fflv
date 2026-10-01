@@ -35,6 +35,12 @@ const SOFT_SEEK_FRAMES = 8;
  * caught up frame by frame: the player seeks to where the clock is.
  */
 const LATE_JUMP_US = 2_000_000;
+/**
+ * While the tab is hidden there are no animation frames: a timer at about the frame rate (but at
+ * least this often) keeps consuming due composite frames, so decoding, reading and therefore the
+ * audio fed from the read-ahead go on.
+ */
+const HIDDEN_TICK_MAX_MS = 50;
 
 export interface PlayerStats {
   shown: number;
@@ -103,6 +109,7 @@ export class Player extends EventTarget {
   private lastRafMs = 0;
   private refreshMs = 1000 / 60;
   private loadToken = 0;
+  private hiddenTimer = 0;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -110,7 +117,10 @@ export class Player extends EventTarget {
   ) {
     super();
     this.compositor = new Compositor(canvas);
+    this.compositor.onRestored = () => this.redraw();
     this.raf = requestAnimationFrame(this.tick);
+    document.addEventListener('visibilitychange', this.onVisibility);
+    this.onVisibility();
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -122,29 +132,31 @@ export class Player extends EventTarget {
     this.close();
     this.origin = typeof input === 'string' ? { kind: 'url', url: input, name } : { kind: 'blob', blob: input, name };
     this.setMode('loading');
+    // Owned here until handed to the player; disposed if the load fails or is superseded.
+    let audio: AudioClock | null = null;
+    let pipeline: DecodePipeline | null = null;
+    const discard = () => {
+      pipeline?.dispose();
+      audio?.dispose();
+    };
     try {
       const bytes = typeof input === 'string' ? await HttpByteSource.open(input, name) : input;
       const source = await LvfSource.open(bytes, name);
-      const audio = source.meta.audio && !this.opts.noAudio ? await AudioClock.create(source.meta.audio) : null;
-      if (token !== this.loadToken) return audio?.dispose();
+      audio = source.meta.audio && !this.opts.noAudio ? await AudioClock.create(source.meta.audio) : null;
+      if (token !== this.loadToken) return discard();
       await this.compositor.load(source.meta, (i) => source.stillBlob(source.meta.layers[i] as StillLayerMeta));
-      if (token !== this.loadToken) {
-        audio?.dispose();
-        return;
-      }
-      const pipeline = await DecodePipeline.create(source, audio, this.opts.pipeline);
-      if (token !== this.loadToken) {
-        pipeline.dispose();
-        audio?.dispose();
-        return;
-      }
+      if (token !== this.loadToken) return discard();
+      pipeline = await DecodePipeline.create(source, audio, this.opts.pipeline);
+      if (token !== this.loadToken) return discard();
+      const owned = { pipeline, audio };
+      audio = pipeline = null; // the player owns them now (close() disposes them)
       this.source = source;
       if (bytes instanceof HttpByteSource) this.watchedEtag = bytes.etag;
-      this.audio = audio;
-      this.clock = audio ?? new PerformanceClock();
-      this.notice = source.meta.audio && !audio ? 'audio track present but not decodable here; playing without audio' : null;
-      this.pipeline = pipeline;
-      pipeline.onError = (e) => this.fail(e);
+      this.audio = owned.audio;
+      this.clock = owned.audio ?? new PerformanceClock();
+      this.notice = source.meta.audio && !owned.audio ? 'audio track present but not decodable here; playing without audio' : null;
+      this.pipeline = owned.pipeline;
+      owned.pipeline.onError = (e) => this.fail(e);
       this.layerStates = source.meta.layers.map((L) => ({ visible: L.visible, opacity: L.opacity, ...keep?.overrides.get(L.id) }));
       const fileOrder = zOrder(source.meta.layers);
       const ids = source.meta.layers.map((L) => L.id);
@@ -153,6 +165,7 @@ export class Player extends EventTarget {
       this.emit('loaded');
       this.startSeek(Math.min(keep?.frame ?? 0, source.frameCount - 1), keep?.playing ?? false);
     } catch (e) {
+      discard();
       if (token !== this.loadToken) return;
       if (e instanceof SourceChangedError) {
         window.setTimeout(() => void this.reload(), 200); // replaced while opening: try again
@@ -453,17 +466,34 @@ export class Player extends EventTarget {
     const dt = now - this.lastRafMs;
     if (this.lastRafMs && dt > 2 && dt < 100) this.refreshMs += (dt - this.refreshMs) * 0.1;
     this.lastRafMs = now;
-    const p = this.pipeline;
-    if (p && !p.error) {
-      if (this.mode === 'seeking') this.tickSeeking(p);
-      else if (this.mode === 'playing') this.tickPlaying(p, now);
-      else if (this.mode === 'buffering') this.tickBuffering(p);
-    }
+    this.advance(now, true);
     if (this.dirty) {
       this.dirty = false;
       this.compositor.draw(this.current, this.layerStates);
       this.emit('draw');
     }
+  };
+
+  /** One step of the state machine. `visible` false: a hidden tab's timer tick (nothing is drawn). */
+  private advance(now: number, visible: boolean): void {
+    const p = this.pipeline;
+    if (!p || p.error) return;
+    if (this.mode === 'seeking') this.tickSeeking(p);
+    else if (this.mode === 'playing') this.tickPlaying(p, now, visible);
+    else if (this.mode === 'buffering') this.tickBuffering(p);
+  }
+
+  /** Drive advance() from a timer while the tab is hidden (requestAnimationFrame stops then). */
+  private onVisibility = (): void => {
+    window.clearInterval(this.hiddenTimer);
+    this.hiddenTimer = 0;
+    if (!document.hidden) return;
+    const fps = this.source?.meta.fps;
+    const frameMs = fps ? (1000 * fps.den) / fps.num : HIDDEN_TICK_MAX_MS;
+    const ms = Math.max(4, Math.min(HIDDEN_TICK_MAX_MS, frameMs));
+    this.hiddenTimer = window.setInterval(() => {
+      if (document.hidden) this.advance(performance.now(), false);
+    }, ms);
   };
 
   private tickSeeking(p: DecodePipeline): void {
@@ -495,7 +525,7 @@ export class Player extends EventTarget {
     }
   }
 
-  private tickPlaying(p: DecodePipeline, now: number): void {
+  private tickPlaying(p: DecodePipeline, now: number, visible: boolean): void {
     const n = this.frameCount;
     const fps = this.source!.meta.fps;
     const t = this.clock.nowUs() + this.displayLeadUs;
@@ -509,7 +539,7 @@ export class Player extends EventTarget {
     for (let f = p.peek(); f && f.ptsUs <= t; f = p.peek()) {
       if (pick) {
         pick.close(); // P4: late — skip the whole composite frame
-        this.stats.dropped++;
+        if (visible) this.stats.dropped++; // in a hidden tab nothing is shown anyway
       }
       pick = p.shift()!;
     }
@@ -603,7 +633,10 @@ export class Player extends EventTarget {
   }
 
   dispose(): void {
+    this.loadToken++; // an open() in progress gives up
     cancelAnimationFrame(this.raf);
+    document.removeEventListener('visibilitychange', this.onVisibility);
+    window.clearInterval(this.hiddenTimer);
     this.watch(false);
     this.close();
   }

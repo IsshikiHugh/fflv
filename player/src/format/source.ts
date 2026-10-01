@@ -5,6 +5,8 @@
 import { BlobByteSource, type ByteSource } from './bytes';
 import {
   HEADER_SIZE,
+  INDEX_ENTRY_SIZE,
+  INDEX_HEADER_SIZE,
   IndexTable,
   LvfFormatError,
   parseCau,
@@ -32,7 +34,9 @@ export class LvfSource {
     const header = parseHeader(await bytes.read(0, HEADER_SIZE), bytes.size);
     const metaBytes = new Uint8Array(await bytes.read(header.metaOffset, header.metaOffset + header.metaLength));
     const meta = parseMeta(metaBytes, header.cauOffset - header.resourcesOffset);
-    const index = parseIndex(await bytes.read(header.indexOffset, bytes.size), header, meta.frame_count);
+    const indexEnd = header.indexOffset + INDEX_HEADER_SIZE + meta.frame_count * INDEX_ENTRY_SIZE;
+    if (indexEnd > bytes.size) throw new LvfFormatError('index table is truncated');
+    const index = parseIndex(await bytes.read(header.indexOffset, indexEnd), header, meta.frame_count);
     return new LvfSource(bytes, header, meta, index, videoLayerIndices(meta));
   }
 
@@ -52,15 +56,16 @@ export class LvfSource {
   /**
    * Read consecutive composite frames starting at `first`: at least one, then as many as fit in
    * `maxFrames` / `maxBytes`. Each is parsed and checked against the index and metadata.
+   * Aborting `signal` rejects with an AbortError.
    */
-  async readCaus(first: number, maxFrames: number, maxBytes: number): Promise<ParsedCau[]> {
+  async readCaus(first: number, maxFrames: number, maxBytes: number, signal?: AbortSignal): Promise<ParsedCau[]> {
     const n = this.frameCount;
     if (first >= n) return [];
     const [start] = this.index.range(first);
     let last = first;
     while (last + 1 < n && last + 1 - first < maxFrames && this.index.range(last + 1)[1] - start <= maxBytes) last++;
     const end = this.index.range(last)[1];
-    const u8 = new Uint8Array(await this.bytes.read(start, end));
+    const u8 = new Uint8Array(await this.bytes.read(start, end, signal));
     if (u8.byteLength !== end - start) throw new LvfFormatError(`short read at offset ${start}`);
     const out: ParsedCau[] = [];
     for (let f = first; f <= last; f++) {

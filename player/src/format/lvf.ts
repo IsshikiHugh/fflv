@@ -141,6 +141,13 @@ export interface LvfMeta {
 
 const isInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v);
 
+/** Largest canvas / coded frame side accepted (WebGL and decoders have limits around this). */
+export const MAX_DIMENSION = 16384;
+/** Most video layers accepted: each one costs a decoder (two with alpha). */
+export const MAX_VIDEO_LAYERS = 64;
+
+const isDim = (v: unknown): v is number => isInt(v) && v > 0 && v <= MAX_DIMENSION;
+
 export function parseMeta(bytes: Uint8Array, resourcesSize: number): LvfMeta {
   let m: LvfMeta;
   try {
@@ -152,8 +159,7 @@ export function parseMeta(bytes: Uint8Array, resourcesSize: number): LvfMeta {
     throw new LvfFormatError(`metadata: ${msg}`);
   };
   if (m?.format !== 'LVF' || m.version !== 1) fail('format/version must be "LVF"/1');
-  if (!isInt(m.canvas?.width) || !isInt(m.canvas?.height) || m.canvas.width <= 0 || m.canvas.height <= 0)
-    fail('canvas width/height must be positive integers');
+  if (!isDim(m.canvas?.width) || !isDim(m.canvas?.height)) fail(`canvas width/height must be integers in 1..${MAX_DIMENSION}`);
   if (!/^#[0-9a-fA-F]{6}$/.test(m.canvas.background ?? '')) fail('canvas.background must be #RRGGBB');
   if (!isInt(m.fps?.num) || !isInt(m.fps?.den) || m.fps.num <= 0 || m.fps.den <= 0) fail('fps must be {num, den}');
   if (!isInt(m.frame_count) || m.frame_count <= 0) fail('frame_count must be a positive integer');
@@ -161,6 +167,7 @@ export function parseMeta(bytes: Uint8Array, resourcesSize: number): LvfMeta {
   if (!Array.isArray(m.layers)) fail('layers must be an array');
   m.layers.forEach((L, i) => {
     const tag = `layer ${i} (${L?.id})`;
+    if (L === null || typeof L !== 'object') fail(`layer ${i} is not an object`);
     if (L.kind !== 'video' && L.kind !== 'still') fail(`${tag}: unknown kind ${(L as { kind: unknown }).kind}`);
     if (!isInt(L.start_frame) || !isInt(L.end_frame) || !(0 <= L.start_frame && L.start_frame < L.end_frame && L.end_frame <= m.frame_count))
       fail(`${tag}: bad frame interval`);
@@ -171,7 +178,7 @@ export function parseMeta(bytes: Uint8Array, resourcesSize: number): LvfMeta {
     if (typeof L.visible !== 'boolean') fail(`${tag}: visible must be boolean`);
     if (typeof L.z !== 'number') fail(`${tag}: z must be a number`);
     if (L.kind === 'video') {
-      if (typeof L.codec !== 'string' || !isInt(L.coded_width) || !isInt(L.coded_height)) fail(`${tag}: bad codec info`);
+      if (typeof L.codec !== 'string' || !isDim(L.coded_width) || !isDim(L.coded_height)) fail(`${tag}: bad codec info`);
       if (L.has_alpha && typeof L.alpha_codec !== 'string') fail(`${tag}: has_alpha without alpha_codec`);
       if (L.alpha_range !== undefined && L.alpha_range !== 'limited' && L.alpha_range !== 'full') fail(`${tag}: bad alpha_range`);
       const cs = L.content_size;
@@ -183,8 +190,13 @@ export function parseMeta(bytes: Uint8Array, resourcesSize: number): LvfMeta {
         fail(`${tag}: resource lies outside the resource region`);
     }
   });
+  if (videoLayerIndices(m).length > MAX_VIDEO_LAYERS) fail(`more than ${MAX_VIDEO_LAYERS} video layers`);
   if (m.audio !== null) {
-    if (m.audio?.codec !== 'opus' || m.audio.sample_rate !== 48000 || !isInt(m.audio.channels)) fail('audio must be 48 kHz Opus or null');
+    const a = m.audio;
+    if (a?.codec !== 'opus' || a.sample_rate !== 48000 || !isInt(a.channels) || a.channels <= 0) fail('audio must be 48 kHz Opus or null');
+    if (a.pre_skip !== undefined && !(isInt(a.pre_skip) && a.pre_skip >= 0)) fail('audio.pre_skip must be a non-negative integer');
+    if (a.description_b64 !== null && a.description_b64 !== undefined && typeof a.description_b64 !== 'string')
+      fail('audio.description_b64 must be a string or null');
   }
   return m;
 }

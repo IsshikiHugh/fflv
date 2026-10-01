@@ -345,7 +345,7 @@ export function bindUi(player: Player): void {
   blurAfterMouse(btnExport);
   btnExport.addEventListener('click', () => {
     if (exporting === null) void startExport();
-    else void fetch(`/export/${exporting}/cancel`, { method: 'POST' });
+    else void fetch(`/export/${exporting}/cancel`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   });
   exportFormat.addEventListener('change', () => {
     pref.set('exportFormat', exportFormat.value);

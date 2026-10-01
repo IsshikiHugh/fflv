@@ -2,13 +2,15 @@
  * Reader → dispatcher → per-plane decoders → composite-frame assembler → ready queue (spec 9.2).
  *
  *  - Composite frames are read ahead (compressed) in bounded batches; their audio packets go to the
- *    audio sink immediately, so audio is decoded well ahead of the playhead.
+ *    audio sink immediately, so audio is decoded well ahead of the playhead. Reading starts when
+ *    the read-ahead falls to half of its limit and then refills it, so steady playback makes a few
+ *    large range requests instead of one per frame.
  *  - Every FRAME entry of a composite frame is sent to its layer's decoders, hidden or not (P5).
  *  - A composite frame becomes "ready" only when every plane it needs has been decoded (P1), and
  *    frames are released strictly in frame order.
  *  - Back-pressure: ready + in-flight composite frames are capped (spec 9.4).
  */
-import { CompositeFrame, extractLuma, hasCopyableLuma, release, type LayerPlanes } from './frames';
+import { CompositeFrame, extractLuma, hasCopyableLuma, release, releaseLuma, type LayerPlanes } from './frames';
 import { PlaneDecoder, type PlaneKind, type PlaneSink } from './planeDecoder';
 import { ENTRY_FRAME, type AudioPacket, type ParsedCau, type VideoLayerMeta } from '../format/lvf';
 import type { LvfSource } from '../format/source';
@@ -16,8 +18,8 @@ import { ptsUs } from '../format/timing';
 
 export interface AudioSink {
   feed(packet: AudioPacket): void;
-  /** Drop everything queued; the next packets start a new (seeked) stream. */
-  reset(): void;
+  /** Drop everything queued; the next packets start a new (seeked) stream at `targetUs`. */
+  reset(targetUs: number): void;
 }
 
 export interface PipelineOptions {
@@ -74,7 +76,9 @@ export class DecodePipeline implements PlaneSink {
   private nextRelease = 0;
   private discardBefore = 0;
   private gen = 0;
-  private reading = false;
+  /** Generation whose read loop is running (a superseded loop is aborted, not waited for). */
+  private readingGen = -1;
+  private abort = new AbortController();
   private disposed = false;
 
   private constructor(
@@ -156,7 +160,7 @@ export class DecodePipeline implements PlaneSink {
    * RAP at or before `target`; complete frames before `target` are discarded as preroll.
    */
   seek(target: number): void {
-    this.gen++;
+    this.newGeneration();
     for (const f of this.ready) f.close();
     this.ready.length = 0;
     for (const p of this.pending.values()) closePlanes(p.planes);
@@ -168,7 +172,7 @@ export class DecodePipeline implements PlaneSink {
       d.color.reset();
       d.alpha?.reset();
     }
-    this.audio?.reset();
+    this.audio?.reset(ptsUs(target, this.source.meta.fps));
     const rap = this.source.index.rapAtOrBefore(target);
     this.readPos = rap;
     this.nextRelease = rap;
@@ -178,7 +182,7 @@ export class DecodePipeline implements PlaneSink {
 
   dispose(): void {
     this.disposed = true;
-    this.gen++;
+    this.newGeneration();
     for (const f of this.ready) f.close();
     this.ready.length = 0;
     for (const p of this.pending.values()) closePlanes(p.planes);
@@ -189,26 +193,40 @@ export class DecodePipeline implements PlaneSink {
     }
   }
 
+  /** Start a new generation: outputs, reads and callbacks of the previous one are ignored. */
+  private newGeneration(): void {
+    this.gen++;
+    this.abort.abort();
+    this.abort = new AbortController();
+  }
+
   // ----------------------------------------------------------------------------------------------
   // Reading and dispatch
   // ----------------------------------------------------------------------------------------------
   kick(): void {
     if (this.disposed || this.error) return;
     this.feed();
-    if (!this.reading && this.readPos < this.source.frameCount && !this.readAheadFull()) void this.readLoop(this.gen);
+    if (this.readingGen !== this.gen && this.readPos < this.source.frameCount && this.readAheadLow()) void this.readLoop(this.gen);
   }
 
   private readAheadFull(): boolean {
     return this.parsed.length >= this.opts.readAheadFrames || this.parsedBytes >= this.opts.readAheadBytes;
   }
 
+  /** Low-water mark: below it a read starts (and goes on until the read-ahead is full). */
+  private readAheadLow(): boolean {
+    return this.parsed.length <= this.opts.readAheadFrames >> 1 && this.parsedBytes <= this.opts.readAheadBytes / 2;
+  }
+
   private async readLoop(gen: number): Promise<void> {
-    this.reading = true;
+    this.readingGen = gen;
+    const signal = this.abort.signal;
     try {
       while (gen === this.gen && !this.error && this.readPos < this.source.frameCount && !this.readAheadFull()) {
         const want = this.opts.readAheadFrames - this.parsed.length;
         if (this.opts.readDelayMs) await new Promise((r) => setTimeout(r, this.opts.readDelayMs));
-        const batch = await this.source.readCaus(this.readPos, want, this.opts.batchBytes);
+        if (gen !== this.gen) break;
+        const batch = await this.source.readCaus(this.readPos, want, this.opts.batchBytes, signal);
         if (gen !== this.gen) break;
         for (const cau of batch) {
           this.parsed.push(cau);
@@ -219,12 +237,10 @@ export class DecodePipeline implements PlaneSink {
         this.feed();
       }
     } catch (e) {
-      if (gen === this.gen) this.fail(e as Error);
+      if (gen === this.gen) this.fail(e as Error); // a superseded read ends with an AbortError
     } finally {
-      this.reading = false;
+      if (this.readingGen === gen) this.readingGen = -1;
     }
-    // A seek during the await started a new generation whose kick() found us still reading.
-    if (gen !== this.gen) this.kick();
   }
 
   private canDispatch(): boolean {
@@ -259,6 +275,13 @@ export class DecodePipeline implements PlaneSink {
           pend.remaining++;
           d.alpha.decode(f, e.key, e.alpha!);
         }
+        // The layer's last frame (at the end of the file too): no more input follows to push
+        // frames a decoder holds back out of it, so flush. Its next chunk comes after a seek
+        // (reset), which starts with a key frame.
+        if (f === this.source.meta.layers[e.layerIndex].end_frame - 1) {
+          d.color.flush();
+          d.alpha?.flush();
+        }
       }
     } catch (err) {
       this.fail(err as Error);
@@ -289,7 +312,7 @@ export class DecodePipeline implements PlaneSink {
       extractLuma(frame).then(
         (luma) => {
           release(frame);
-          if (this.pending.get(frameIndex) !== pend || s.alphaLuma) return; // seeked away meanwhile
+          if (this.pending.get(frameIndex) !== pend || s.alphaLuma) return releaseLuma(luma); // seeked away meanwhile
           s.alphaLuma = luma;
           if (--pend.remaining === 0) this.releaseComplete();
         },
@@ -371,6 +394,7 @@ function closePlanes(planes: Map<number, LayerPlanes>): void {
   for (const p of planes.values()) {
     release(p.color);
     release(p.alpha);
+    releaseLuma(p.alphaLuma);
   }
   planes.clear();
 }

@@ -59,16 +59,13 @@ export class AudioClock implements MediaClock, AudioSink {
   private lastNowUs = 0;
   private startToken = 0;
 
-  private constructor(meta: AudioMeta, config: AudioDecoderConfig) {
+  private constructor(meta: AudioMeta, config: AudioDecoderConfig, head: Uint8Array | null) {
     this.config = config;
     this.ctx = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: 'interactive' });
     this.gain = this.ctx.createGain();
     this.gain.connect(this.ctx.destination);
     let preSkip = meta.pre_skip ?? 0;
-    if (meta.pre_skip === undefined && meta.description_b64) {
-      const head = b64(meta.description_b64);
-      if (head.length >= 12) preSkip = head[10] | (head[11] << 8);
-    }
+    if (meta.pre_skip === undefined && head && head.length >= 12) preSkip = head[10] | (head[11] << 8);
     this.preSkipSamples = preSkip;
     this.decoder = this.createDecoder();
   }
@@ -77,9 +74,17 @@ export class AudioClock implements MediaClock, AudioSink {
   static async create(meta: AudioMeta): Promise<AudioClock | null> {
     if (typeof AudioDecoder === 'undefined') return null;
     const config: AudioDecoderConfig = { codec: 'opus', sampleRate: meta.sample_rate, numberOfChannels: meta.channels };
-    if (meta.description_b64) config.description = b64(meta.description_b64);
-    const res = await AudioDecoder.isConfigSupported(config);
-    return res.supported ? new AudioClock(meta, config) : null;
+    let head: Uint8Array | null = null;
+    if (meta.description_b64) {
+      try {
+        head = b64(meta.description_b64);
+      } catch {
+        return null; // not base64: an OpusHead we cannot use, so play without audio
+      }
+      config.description = head;
+    }
+    const res = await AudioDecoder.isConfigSupported(config).catch(() => null); // TypeError: invalid config
+    return res?.supported ? new AudioClock(meta, config, head) : null;
   }
 
   private createDecoder(): AudioDecoder {
@@ -109,9 +114,13 @@ export class AudioClock implements MediaClock, AudioSink {
     this.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: p.ptsUs, duration: p.durationUs, data: p.data }));
   }
 
-  /** Called on seek: a fresh decoder (so no stale output can leak in) and no decoded audio. */
-  reset(): void {
-    this.stopSources();
+  /**
+   * Called on seek: a fresh decoder (so no stale output can leak in) and no decoded audio. The
+   * frozen clock moves to the seek target right away: decoded audio is pruned relative to it, and
+   * audio for the new position arrives before the player sets the clock to the first shown frame.
+   */
+  reset(targetUs: number): void {
+    this.setTime(targetUs);
     this.buffers = [];
     if (this.decoder.state !== 'closed') this.decoder.close();
     this.error = null;
