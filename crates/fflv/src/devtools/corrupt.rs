@@ -16,6 +16,7 @@ use lvf::{validate, Cau, IndexEntry, LvfReader, LvfWriter, Meta, VideoEntry};
 
 use crate::error::{Error, Result};
 
+#[derive(Clone)]
 pub struct Source {
     pub meta: Meta,
     pub meta_bytes: Vec<u8>,
@@ -247,8 +248,9 @@ pub const MUTATIONS: [Mutation; 13] = [
     },
 ];
 
-pub fn write_variant(src: &Path, m: &Mutation, out: &Path) -> Result<PathBuf> {
-    let mut s = Source::load(src)?;
+/// Write `src` with `m` applied (to a copy: `src` is loaded once and shared by every variant).
+pub fn write_variant(src: &Source, m: &Mutation, out: &Path) -> Result<PathBuf> {
+    let mut s = src.clone();
     let fix = (m.apply)(&mut s)?;
     let dst = out.join(format!("{}.lvd", m.name));
     let mut w = LvfWriter::create(&dst)?;
@@ -294,9 +296,10 @@ pub fn run(source: &Path, out: Option<&Path>, check_variants: bool) -> Result<us
     if !validate(source).ok() {
         return Err(Error::Edit(format!("{} is not valid to begin with", source.display())));
     }
+    let src = Source::load(source)?;
     let mut failures = 0;
     for m in &MUTATIONS {
-        let path = write_variant(source, m, &out)?;
+        let path = write_variant(&src, m, &out)?;
         let mut line = format!("{:<22} {}", m.name, m.description);
         if check_variants {
             let (ok, msg) = check(&path, m);

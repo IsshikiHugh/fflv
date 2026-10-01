@@ -184,7 +184,7 @@ impl Writer {
     fn add_still(
         &mut self,
         id: &str,
-        png: Vec<u8>,
+        png: &[u8],
         rect_xywh: Option<(i64, i64, i64, i64)>,
         start: u32,
         end: Option<u32>,
@@ -195,7 +195,7 @@ impl Writer {
         visible: bool,
     ) -> PyResult<()> {
         let o = StillOptions { rect: rect(rect_xywh)?, start, end, z, name, blend, opacity, visible };
-        self.inner.add_still(id, png, o).map_err(py_err)
+        self.inner.add_still(id, png.to_vec(), o).map_err(py_err)
     }
 
     fn set_audio(&mut self, py: Python<'_>, src: PathBuf, bitrate: &str, channels: u32) -> PyResult<()> {
@@ -322,8 +322,12 @@ impl Reader {
 
     /// A still layer's image, RGBA.
     fn still<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Bound<'py, PyArrayDyn<u8>>> {
-        let img = self.get()?.still(index).map_err(py_err)?;
-        to_array(py, (*img).clone())
+        let r = self.get()?;
+        if index >= r.layers().len() {
+            return Err(MetaError::new_err(format!("layer index {index} out of range")));
+        }
+        let img = py.detach(|| r.still(index).map(|img| (*img).clone())).map_err(py_err)?;
+        to_array(py, img)
     }
 }
 
@@ -405,6 +409,13 @@ impl LayerFrameIter {
 // ------------------------------------------------------------------------------------------------
 // Edits, pack, render
 // ------------------------------------------------------------------------------------------------
+/// Run an edit (without the GIL) so that Ctrl+C stops it: the rewrite checks for signals every
+/// ~100 ms (see `edit::with_interrupt_check`) and the KeyboardInterrupt comes through as it is.
+fn interruptible<R>(f: impl FnOnce() -> R) -> R {
+    clear_callback_error();
+    edit::with_interrupt_check(|| Python::attach(|py| py.check_signals().map_err(callback_failed)), f)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_options(
     output: Option<PathBuf>,
@@ -471,7 +482,7 @@ fn add_layer(
     )?;
     clear_callback_error();
     let rep = match (source, images) {
-        (Some(src), None) => py.detach(|| edit::add_layer(&path, id, Source::Media(&src), &o)),
+        (Some(src), None) => py.detach(|| interruptible(|| edit::add_layer(&path, id, Source::Media(&src), &o))),
         (None, Some(iter)) => {
             let next = move || -> Option<fflv::Result<Image>> {
                 Python::attach(|py| {
@@ -492,7 +503,7 @@ fn add_layer(
                 })
             };
             let images = Box::new(std::iter::from_fn(next));
-            py.detach(|| edit::add_layer(&path, id, Source::Images { images, len: length }, &o))
+            py.detach(|| interruptible(|| edit::add_layer(&path, id, Source::Images { images, len: length }, &o)))
         }
         _ => return Err(PyValueError::new_err("give a media file or an image iterator")),
     };
@@ -505,7 +516,7 @@ fn add_still(
     py: Python<'_>,
     path: PathBuf,
     id: &str,
-    png: Vec<u8>,
+    png: &[u8],
     output: Option<PathBuf>,
     rect_xywh: Option<(i64, i64, i64, i64)>,
     start: u32,
@@ -520,7 +531,7 @@ fn add_still(
     let o = add_options(
         output, start, end, None, false, rect_xywh, z, name, blend, opacity, visible, 32, "balanced", check,
     )?;
-    let rep = py.detach(|| edit::add_still(&path, id, png, &o)).map_err(py_err)?;
+    let rep = py.detach(|| interruptible(|| edit::add_still(&path, id, png.to_vec(), &o))).map_err(py_err)?;
     Ok(report_json(rep.as_ref()))
 }
 
@@ -532,7 +543,8 @@ fn remove_layers(
     output: Option<PathBuf>,
     check: bool,
 ) -> PyResult<Option<String>> {
-    let rep = py.detach(|| edit::remove_layers(&path, &keys, output.as_deref(), check)).map_err(py_err)?;
+    let rep =
+        py.detach(|| interruptible(|| edit::remove_layers(&path, &keys, output.as_deref(), check))).map_err(py_err)?;
     Ok(report_json(rep.as_ref()))
 }
 
@@ -547,7 +559,9 @@ fn set_audio(
     check: bool,
 ) -> PyResult<Option<String>> {
     let rep = py
-        .detach(|| edit::set_audio(&path, source.as_deref(), output.as_deref(), bitrate, channels, check))
+        .detach(|| {
+            interruptible(|| edit::set_audio(&path, source.as_deref(), output.as_deref(), bitrate, channels, check))
+        })
         .map_err(py_err)?;
     Ok(report_json(rep.as_ref()))
 }
@@ -557,7 +571,7 @@ fn set_audio(
 fn set_layer(py: Python<'_>, path: PathBuf, key: &str, fields_json: &str, output: Option<PathBuf>) -> PyResult<bool> {
     let pairs: Vec<(String, serde_json::Value)> =
         serde_json::from_str(fields_json).map_err(|e| MetaError::new_err(format!("bad field values: {e}")))?;
-    py.detach(|| edit::set_layer(&path, key, &pairs, output.as_deref())).map_err(py_err)
+    py.detach(|| interruptible(|| edit::set_layer(&path, key, &pairs, output.as_deref()))).map_err(py_err)
 }
 
 #[pyfunction]
@@ -667,8 +681,8 @@ fn encode_png<'py>(py: Python<'py>, image: PyReadonlyArrayDyn<'_, u8>) -> PyResu
 }
 
 #[pyfunction]
-fn decode_png<'py>(py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyArrayDyn<u8>>> {
-    let img = fflv::image::decode_png(&data).map_err(py_err)?;
+fn decode_png<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyArrayDyn<u8>>> {
+    let img = py.detach(|| fflv::image::decode_png(data)).map_err(py_err)?;
     to_array(py, img)
 }
 
@@ -680,8 +694,8 @@ fn png_from_file<'py>(py: Python<'py>, path: PathBuf) -> PyResult<Bound<'py, PyB
 }
 
 #[pyfunction]
-fn png_size(data: Vec<u8>) -> PyResult<(u32, u32)> {
-    fflv::image::png_size(&data).map_err(py_err)
+fn png_size(data: &[u8]) -> PyResult<(u32, u32)> {
+    fflv::image::png_size(data).map_err(py_err)
 }
 
 /// Serve `path` with the player until Ctrl+C (KeyboardInterrupt) or another exception from a

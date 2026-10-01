@@ -150,6 +150,25 @@ def test_requests_for_other_hosts_are_refused(server):
     assert st == 200 and len(body) == int(h["Content-Length"])
 
 
+def test_request_bodies_are_limited(server):
+    srv, _ = server
+    assert get(srv.media_url, {"Range": "bytes=0-3"}, data=b"x" * 2000)[0] == 413  # unexpected body
+    assert get(srv.media_url, {"Range": "bytes=0-3"}, data=b"x" * 100)[0] == 206  # small: ignored
+    assert post(f"{srv.base}/export", b" " * ((1 << 20) + 1))[0] == 413
+
+
+def test_non_loopback_host_warns_and_still_checks_the_host(packed):
+    srv = Server(packed["path"], "--host", "0.0.0.0")
+    try:
+        assert get(srv.media_url, {"Range": "bytes=0-3"})[0] == 206  # Host: an IP address
+        assert get(srv.media_url, {"Host": "evil.example.com", "Range": "bytes=0-3"})[0] == 403
+    finally:
+        srv.proc.kill()
+        err = srv.proc.stderr.read()
+        srv.stop()
+    assert "not a loopback address" in err
+
+
 @pytest.mark.parametrize("args", [(), ("--no-open",)])
 def test_the_page_is_not_opened_by_default(packed, args):
     srv = Server(packed["path"], *args)  # --no-open is still accepted
@@ -284,6 +303,7 @@ def test_export_errors_and_cancel(layered, tmp_path):
     st, _, body = post(url, {"layers": ["bg", "dot"], "format": "mkv"})
     eid = json.loads(body)["id"]
     assert post(url, {"layers": ["bg"]})[0] == 409  # one at a time
+    assert post(f"{url}/{eid}/cancel", {}, content_type="text/plain")[0] == 415  # no cross-site cancel
     assert post(f"{url}/{eid}/cancel", {})[0] == 200
     deadline = time.monotonic() + 30
     while (state := json.loads(get(f"{url}/{eid}")[2])["state"]) == "running":

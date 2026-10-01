@@ -57,6 +57,22 @@ def test_cli_workflow(packed, tmp_path):
     assert fflv.cli.main(["check", "-q", str(f)]) == 0  # the same command line, in process
 
 
+def test_rm_audio_to_output_reads_the_source(packed, tmp_path):
+    """`rm FILE --audio -o OUT` writes FILE minus its audio to OUT (with or without layers), leaving
+    FILE as it was."""
+    out = tmp_path / "out.lvd"
+    out.write_bytes(b"an unrelated file")
+    fflv_cmd("rm", packed["path"], "--audio", "-o", out)
+    meta = json.loads(fflv_cmd("info", out, "--json").stdout)["meta"]
+    src = json.loads(fflv_cmd("info", packed["path"], "--json").stdout)["meta"]
+    assert meta["audio"] is None and src["audio"] is not None
+    assert [L["id"] for L in meta["layers"]] == [L["id"] for L in src["layers"]]
+    fflv_cmd("rm", packed["path"], "calib", "--audio", "-o", out)
+    meta = json.loads(fflv_cmd("info", out, "--json").stdout)["meta"]
+    assert meta["audio"] is None and "calib" not in [L["id"] for L in meta["layers"]]
+    assert fflv_cmd("rm", packed["path"], ok=False).returncode == 2
+
+
 def test_broken_files_are_reported_precisely(packed, tmp_path):
     """Acceptance 11.2-2: every deliberately broken variant is reported with the right invariant."""
     res = fflv_cmd("corrupt", packed["path"], "--out", tmp_path, "--check")

@@ -4,7 +4,9 @@
 crates/fflv/tests/workflow.rs; here decoded pixels must not change.)
 """
 
+import os
 import shutil
+import stat
 import subprocess
 
 import numpy as np
@@ -176,3 +178,29 @@ def test_non_finite_values_are_meta_errors(base):
             fflv.set_layer(base, "a", z=bad)
     with pytest.raises(fflv.MetaError, match="non-negative"):
         fflv.add_layer(base, "x", [np.zeros((4, 4, 3), np.uint8)], start=-1)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX permissions and symlinks")
+def test_rewrites_keep_permissions_and_symlinks(base, tmp_path):
+    os.chmod(base, 0o640)
+    link = tmp_path / "link.lvd"
+    link.symlink_to(base)
+    fflv.remove_layers(link, ["a"])  # in place, through the link
+    assert link.is_symlink() and os.readlink(link) == str(base)
+    with fflv.open(base) as r:
+        assert [L.id for L in r.layers] == ["b", "s"]
+    assert stat.S_IMODE(base.stat().st_mode) == 0o640
+    out = tmp_path / "out.lvd"
+    fflv.set_audio(base, None, output=out)
+    assert stat.S_IMODE(out.stat().st_mode) == 0o640
+
+
+def test_single_image_is_not_a_frame_stack(base):
+    with pytest.raises(fflv.MetaError, match="one image"):
+        fflv.add_layer(base, "x", np.zeros((H, W, 3), np.uint8))
+    with pytest.raises(fflv.MetaError, match="one image"):
+        fflv.add_layer(base, "x", np.zeros((H, W), np.uint8))
+    fflv.add_layer(base, "stack", np.zeros((N, 8, 6), np.uint8), lossless=True)  # N×H×W gray frames
+    fflv.add_layer(base, "rgba", np.zeros((N, 8, 6, 4), np.uint8), lossless=True)
+    with fflv.open(base) as r:
+        assert r.layer("stack").rect == (0, 0, 6, 8) and r.layer("rgba").has_alpha
