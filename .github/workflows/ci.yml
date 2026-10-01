@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # building fflv builds the web player into it (crates/fflv/build.rs); never without it here
+  FFLV_PLAYER: build
 
 jobs:
   rust:
@@ -25,6 +27,11 @@ jobs:
       - name: Install libvpx and FFmpeg (macOS)
         if: runner.os == 'macOS'
         run: brew install libvpx pkg-config ffmpeg
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: player/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -39,6 +46,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvpx-dev pkg-config libclang-dev ffmpeg
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: player/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
@@ -71,14 +83,10 @@ jobs:
         working-directory: player
       - run: npm test
         working-directory: player
-      - run: npm run build
-        working-directory: player
-      - name: The built player compiled into fflv must be up to date (run `npm run build` and commit crates/fflv/viewer)
-        run: git diff --exit-code --stat -- crates/fflv/viewer
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvpx-dev pkg-config libclang-dev ffmpeg
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build fflv (the end-to-end tests run it) and generate the test material
+      - name: Build fflv with the player (the end-to-end tests run it) and generate the test material
         run: |
           cargo build --release
           ./target/release/fflv testsrc

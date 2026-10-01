@@ -44,8 +44,8 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use crate::error::{Error, Result};
 use crate::render::{render, RenderOptions};
 
-/// The built player (player/, `npm run build`).
-static VIEWER: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/viewer");
+/// The built player (player/), put in place by build.rs: empty when fflv was built without it.
+static VIEWER: Dir<'static> = include_dir!("$OUT_DIR/viewer");
 
 pub fn viewer_is_built() -> bool {
     VIEWER.get_file("index.html").is_some()
@@ -222,7 +222,10 @@ impl ViewServer {
             return Err(Error::View(format!("no such file: {}", media.display())));
         }
         if !viewer_is_built() {
-            return Err(Error::View("this fflv was built without the viewer (run `npm run build` in player/)".into()));
+            return Err(Error::View(
+                "this fflv was built without the web player (npm was missing when it was built, or FFLV_PLAYER=skip)"
+                    .into(),
+            ));
         }
         let last_error = std::cell::RefCell::new(String::new());
         let try_bind = |p: u16| Server::http((host, p)).map_err(|e| *last_error.borrow_mut() = e.to_string()).ok();
