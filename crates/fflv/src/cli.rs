@@ -477,6 +477,7 @@ fn run(cli: Cli) -> Result<i32> {
                 end: Some(end),
                 transparent,
                 crf,
+                ..Default::default()
             };
             let mut p = Progress::new("render");
             let count = render(&file, &output, &o, Some(&mut |d, t| p.update(d, t)))?;

@@ -12,6 +12,12 @@
 - Player: the layer panel can be dragged wider (its left edge; double-click resets), so long layer
   names show in full. Layer thumbnails can be shown over a checkerboard (white and light gray, as in
   Photoshop), black or white (switch at the top of the panel). Both choices are kept in the browser.
+- Player: "Export video" (with `fflv view`) renders the layers shown, at their opacities and in
+  the panel's order, to an MP4 / WebM / MOV / MKV file on the server and downloads it.
+  `RenderOptions` gains `opacity` and `order` (per-layer opacities and a draw order to use instead
+  of the file's).
+- Player: the layer order can be changed by dragging rows (or Move up / down in a row's details);
+  it is kept when the file reloads, and "reset order" restores the file's z order.
 
 ## 0.3.0 (2026-09-27)
 

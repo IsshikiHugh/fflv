@@ -12,6 +12,11 @@
       <header class="topbar">
         <div class="brand">LVF <span>layered video player</span></div>
         <div id="file-name" class="file-name">no file loaded</div>
+        <div id="export" class="export" hidden>
+          <span id="export-status" class="export-status" role="status" aria-live="polite"></span>
+          <select id="export-format" class="export-format" aria-label="Export format" title="Video format of the export"></select>
+          <button id="btn-export" class="btn ghost" type="button" title="Render the layers shown, at their opacities, to a video file (with fflv, like fflv render)">Export video</button>
+        </div>
         <button id="btn-open" class="btn" type="button">Open .lvd…</button>
         <input id="file-input" type="file" accept=".lvd,.lvf" hidden />
       </header>
@@ -95,6 +100,7 @@
             </label>
             <h2>Layers</h2>
             <span id="layer-count" class="count"></span>
+            <button id="order-reset" class="link" type="button" hidden title="Draw the layers in the file's order (z) again">reset order</button>
             <div class="thumb-bg" role="radiogroup" aria-label="Thumbnail background">
               <label class="swatch checker" title="Thumbnail background: checkerboard"><input type="radio" name="thumb-bg" value="checker" checked aria-label="checkerboard" /></label>
               <label class="swatch black" title="Thumbnail background: black"><input type="radio" name="thumb-bg" value="black" aria-label="black" /></label>

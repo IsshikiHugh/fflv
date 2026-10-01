@@ -33,7 +33,13 @@ reloads automatically when the file changes on disk.
 - <kbd>Home</kbd> / <kbd>End</kbd>: first / last frame. <kbd>G</kbd> (or click the frame number): type a frame number.
 - <kbd>1</kbd>–<kbd>9</kbd> (or the layer's eye icon): show / hide a layer. <kbd>0</kbd> (or the eye above the list): show all.
 - <kbd>⇧</kbd>+<kbd>1</kbd>–<kbd>9</kbd> (or <kbd>⌥</kbd>+click the eye): show only that layer; again shows all.
-- Clicking a layer row opens its details: format, active frames, and the opacity slider.
+- Clicking a layer row opens its details: format, active frames, the opacity slider, and
+  Move up / Move down.
+- Drag a layer row to change the draw order; "reset order" goes back to the file's z order. Like
+  visibility and opacity, this changes what the player shows and exports, not the file.
+- **Export video** (top right): fflv renders the layers shown, at their opacities and in the panel's order, to an MP4,
+  WebM, MOV or MKV file (as `fflv render` does), and the browser downloads it. Not available for a
+  file opened with "Open .lvd…" or dropped on the page. Exports have no sound.
 
 The player sources are in `player/`.
 

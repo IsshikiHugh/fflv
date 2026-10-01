@@ -181,6 +181,108 @@ test('thumbnail background: checkerboard, black or white; thumbnails ignore opac
   expect(await bgOf('bg')).toBe('none rgb(0, 0, 0)');
 });
 
+test('layer order: drag a row or use Move up / down; drawn, kept on reload, sent with an export', async ({ page }) => {
+  await openViaServer(page);
+  const ids = await page.evaluate(() => window.__lvf.player.source!.meta.layers.map((L) => L.id));
+  const panel = () => page.locator('#layers li').evaluateAll((lis) => lis.map((li) => li.querySelector('.name')!.lastChild!.textContent));
+  const names = await page.evaluate(() => window.__lvf.player.source!.meta.layers.map((L) => L.name || L.id));
+  const nameOf = (id: string) => names[ids.indexOf(id)];
+  const before = await panel();
+  expect(before[0]).toBe(nameOf('exact'));
+  await expect(page.locator('#order-reset')).toBeHidden();
+
+  // drag the bottom row (bg) to the top: the whole canvas is bg now, no barcode of another layer is read
+  const rows = page.locator('#layers li .row');
+  await rows.last().dragTo(rows.first(), { targetPosition: { x: 40, y: 2 } });
+  const after = await panel();
+  expect(after).toEqual([before[before.length - 1], ...before.slice(0, -1)]);
+  expect(await page.evaluate(() => window.__lvf.player.layerOrder.at(-1))).toBe(ids.indexOf('bg'));
+  await expect(page.locator('#layers li .key').first()).toHaveText('1'); // numbers follow the panel
+  // bg covers the canvas, so the other layers' barcodes show bg's pixels: what bg alone draws
+  const rowAt = (alone: boolean) =>
+    page.evaluate(
+      ({ y, alone }) => {
+        const { player, readRow } = window.__lvf;
+        const saved = player.layerStates.map((s) => ({ ...s }));
+        if (alone) player.layerStates.forEach((s, i) => (s.visible = player.source!.meta.layers[i].id === 'bg'));
+        const row = readRow(player, y);
+        saved.forEach((s, i) => Object.assign(player.layerStates[i], s));
+        return row;
+      },
+      { y: P.barcode.layers.exact.y, alone },
+    );
+  expect(await rowAt(false)).toEqual(await rowAt(true));
+  await expect(page.locator('#order-reset')).toBeVisible();
+
+  // Move down in the details: one row at a time
+  await page.locator('#layers li').first().locator('.row .name').click();
+  await page.locator('#layers li').first().getByRole('button', { name: 'Move down' }).click();
+  expect((await panel())[1]).toBe(nameOf('bg'));
+  await expect(page.locator(`#layers li[data-index="${ids.indexOf('bg')}"] .move-down`)).toBeFocused();
+
+  // the order goes with an export ...
+  const sent = page.waitForRequest((r) => r.url().endsWith('/export') && r.method() === 'POST');
+  await page.locator('#btn-export').click();
+  const order: string[] = (await sent).postDataJSON().order;
+  expect([...order].reverse()).toEqual((await panel()).map((n) => ids[names.indexOf(n!)]));
+  await page.locator('#btn-export').click(); // cancel
+  await expect(page.locator('#export-status')).toHaveText('export cancelled');
+
+  // ... and survives a reload of the file; reset goes back to the file's order
+  const kept = await panel();
+  await page.evaluate(() => window.__lvf.player.reload());
+  await page.waitForFunction(() => window.__lvf.player.mode === 'paused' && window.__lvf.player.reloads === 1);
+  expect(await panel()).toEqual(kept);
+  await page.locator('#order-reset').click();
+  expect(await panel()).toEqual(before);
+  await expect(page.locator('#order-reset')).toBeHidden();
+  expect((await barcodes(page, probe)).codes).toEqual({ bg: 0, sync_a: 0, sync_b: 0, calib: 0, exact: 0 });
+});
+
+test('export: fflv renders the layers shown, at their opacities, and the page downloads the video', async ({ page }) => {
+  await openViaServer(page);
+  const ids = await page.evaluate(() => window.__lvf.player.source!.meta.layers.map((L) => L.id));
+  await expect(page.locator('#export')).toBeVisible();
+  await page.keyboard.press('1'); // hide exact
+  await page.evaluate((i) => window.__lvf.player.setLayerOpacity(i, 0.5), ids.indexOf('calib'));
+  await page.locator('#export-format').selectOption('mkv');
+  await page.locator('#export-format').selectOption('mp4');
+  const sent = page.waitForRequest((r) => r.url().endsWith('/export') && r.method() === 'POST');
+  const downloaded = page.waitForEvent('download', { timeout: 120_000 });
+  await page.locator('#btn-export').click();
+  const request = (await sent).postDataJSON();
+  expect(request.format).toBe('mp4');
+  expect([...request.layers].sort()).toEqual(ids.filter((id) => id !== 'exact').sort());
+  expect(request.opacity.calib).toBe(0.5);
+  await expect(page.locator('#btn-export')).toHaveText('Cancel export');
+  const download = await downloaded;
+  expect(download.suggestedFilename()).toBe('test.mp4');
+  const out = path.join(os.tmpdir(), `fflv-e2e-export-${process.pid}.mp4`);
+  await download.saveAs(out);
+  try {
+    const probe = execFileSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-count_packets', '-show_entries', 'stream=codec_name,nb_read_packets', '-of', 'csv=p=0', out]);
+    expect(probe.toString().trim()).toBe(`h264,${await page.evaluate(() => window.__lvf.player.frameCount)}`);
+  } finally {
+    fs.rmSync(out, { force: true });
+  }
+  await expect(page.locator('#export-status')).toHaveText('exported test.mp4');
+  await expect(page.locator('#btn-export')).toHaveText('Export video');
+
+  // an export can be cancelled; the format choice is kept
+  await page.locator('#btn-export').click();
+  await expect(page.locator('#btn-export')).toHaveText('Cancel export');
+  await page.locator('#btn-export').click();
+  await expect(page.locator('#export-status')).toHaveText('export cancelled');
+  await page.reload();
+  await page.waitForFunction(() => window.__lvf.player.mode === 'paused');
+  await expect(page.locator('#export-format')).toHaveValue('mp4');
+
+  // a file opened in the page itself is not the one fflv serves: no export
+  await page.setInputFiles('#file-input', TEST_FILE);
+  await page.waitForFunction(() => window.__lvf.player.mode === 'paused' && window.__lvf.player.sourceUrl === null);
+  await expect(page.locator('#export')).toBeHidden();
+});
+
 test.describe('following edits to the file', () => {
   let server: ChildProcess;
   let dir: string;

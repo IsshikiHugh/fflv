@@ -1,14 +1,20 @@
-"""The `fflv view` server: HTTP range requests, ETags, If-Match, the bundled player."""
+"""The `fflv view` server: HTTP range requests, ETags, If-Match, the bundled player, export."""
 
+import json
 import os
 import re
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 
+import numpy as np
 import pytest
+
+import fflv
+from conftest import read_video
 
 
 class Server:
@@ -38,13 +44,18 @@ def server(packed):
     srv.stop()
 
 
-def get(url, headers=None, method="GET"):
-    req = urllib.request.Request(url, headers=headers or {}, method=method)
+def get(url, headers=None, method="GET", data=None):
+    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     try:
         with urllib.request.urlopen(req) as res:
             return res.status, dict(res.headers), res.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read()
+
+
+def post(url, body, content_type="application/json"):
+    data = body if isinstance(body, bytes) else json.dumps(body).encode()
+    return get(url, {"Content-Type": content_type}, method="POST", data=data)
 
 
 def test_ranges(server):
@@ -174,3 +185,109 @@ def test_view_from_python(packed, tmp_path):
     assert urls and "/?src=/media/small.lvd" in urls[0]
     with pytest.raises(urllib.error.URLError):
         urllib.request.urlopen(urls[0], timeout=2)  # stopped
+
+
+# ---- export ------------------------------------------------------------------------------------
+W, H, N = 96, 64, 12
+
+
+@pytest.fixture
+def layered(tmp_path):
+    path = tmp_path / "layered.lvd"
+    with fflv.Writer(path, (W, H), gop=4, background="#102030") as w:
+        w.add_layer("bg", lossless=True)
+        w.add_layer("dot", alpha=True, lossless=True, rect=(10, 10, 16, 16))
+        w.add_layer("hidden", visible=False, lossless=True, rect=(0, 0, 8, 8))
+        for f in range(N):
+            bg = np.zeros((H, W, 3), np.uint8)
+            bg[:, :, 0] = f * 10
+            dot = np.zeros((16, 16, 4), np.uint8)
+            dot[4:12, 4:12] = (255, 255, 255, 255)
+            w.write(bg=bg, dot=dot, hidden=np.full((8, 8, 3), 255, np.uint8))
+    srv = Server(path)
+    yield srv, path
+    srv.stop()
+
+
+def export(srv, request, tmp_path):
+    """Run one export to the end; returns (final status, the downloaded file or None, its headers)."""
+    st, _, body = post(f"{srv.base}/export", request)
+    assert st == 202, body
+    eid = json.loads(body)["id"]
+    deadline = time.monotonic() + 60
+    while True:
+        st, _, body = get(f"{srv.base}/export/{eid}")
+        status = json.loads(body)
+        assert st == 200 and status["id"] == eid
+        if status["state"] != "running":
+            break
+        assert time.monotonic() < deadline, status
+        time.sleep(0.05)
+    if status["state"] != "done":
+        return status, None, None
+    st, h, data = get(f"{srv.base}/export/{eid}/file")
+    assert st == 200 and int(h["Content-Length"]) == len(data)
+    out = tmp_path / f"export-{eid}.{request.get('format', 'mp4')}"
+    out.write_bytes(data)
+    return status, out, h
+
+
+def test_export_renders_the_layers_shown_at_their_opacities(layered, tmp_path):
+    srv, path = layered
+    st, _, body = get(f"{srv.base}/export")
+    assert st == 200 and json.loads(body) == {"media": "/media/layered.lvd", "formats": ["mp4", "webm", "mov", "mkv"]}
+
+    # a layer hidden in the file, shown in the player
+    status, out, h = export(srv, {"format": "mkv", "layers": ["bg", "hidden"]}, tmp_path)
+    assert status["done"] == status["total"] == N
+    assert h["Content-Type"] == "video/x-matroska" and 'filename="layered.mkv"' in h["Content-Disposition"]
+    fflv.render(path, tmp_path / "want.mkv", layers=["bg", "hidden"])
+    got, want = read_video(out), read_video(tmp_path / "want.mkv")
+    assert len(got) == N and all(np.array_equal(a, b) for a, b in zip(got, want))
+    assert tuple(got[3][2, 2]) == (255, 255, 255)
+
+    # opacity 0 is the same as hidden; 0.5 mixes with what is below
+    _, out, _ = export(srv, {"format": "mkv", "layers": ["bg", "dot"], "opacity": {"dot": 0}}, tmp_path)
+    fflv.render(path, tmp_path / "bg.mkv", layers=["bg"])
+    assert all(np.array_equal(a, b) for a, b in zip(read_video(out), read_video(tmp_path / "bg.mkv")))
+    _, out, _ = export(srv, {"format": "mkv", "layers": ["bg", "dot"], "opacity": {"dot": 0.5, "bg": 1}}, tmp_path)
+    px = read_video(out)[4][18, 18].astype(int)  # the dot over bg (40, 0, 0)
+    assert np.abs(px - (148, 128, 128)).max() <= 2
+
+    # the draw order: bg (opaque, full canvas) moved over the dot covers it
+    status, out, _ = export(srv, {"format": "mkv", "layers": ["bg", "dot"], "order": ["dot", "bg", "hidden"]}, tmp_path)
+    assert all(np.array_equal(a, b) for a, b in zip(read_video(out), read_video(tmp_path / "bg.mkv")))
+
+    # H.264 by default; the previous export's file is gone once a new one starts
+    previous = f"{srv.base}/export/{status['id']}/file"
+    assert get(previous)[0] == 200
+    status, out, h = export(srv, {"layers": ["bg", "dot"]}, tmp_path)
+    assert h["Content-Type"] == "video/mp4" and len(read_video(out)) == N
+    assert get(previous)[0] == 404
+    status, _, _ = export(srv, {"format": "mkv", "layers": ["bg"], "order": ["nope"]}, tmp_path)
+    assert status["state"] == "failed" and "nope" in status["error"]
+
+
+def test_export_errors_and_cancel(layered, tmp_path):
+    srv, _ = layered
+    url = f"{srv.base}/export"
+    assert post(url, {"layers": []}, content_type="text/plain")[0] == 415  # no simple cross-site POSTs
+    assert post(url, {"format": "gif", "layers": []})[0] == 400
+    assert post(url, {"layers": "bg"})[0] == 400
+    assert post(url, b"{")[0] == 400
+    assert post(url, {"layers": [], "opacity": {"bg": 1.5}})[0] == 400
+    assert get(url, {"Host": "evil.example.com"})[0] == 403
+    assert get(f"{url}/99")[0] == 404 and get(f"{url}/99/file")[0] == 404
+    status, out, _ = export(srv, {"layers": ["nope"]}, tmp_path)
+    assert status["state"] == "failed" and "nope" in status["error"] and out is None
+
+    st, _, body = post(url, {"layers": ["bg", "dot"], "format": "mkv"})
+    eid = json.loads(body)["id"]
+    assert post(url, {"layers": ["bg"]})[0] == 409  # one at a time
+    assert post(f"{url}/{eid}/cancel", {})[0] == 200
+    deadline = time.monotonic() + 30
+    while (state := json.loads(get(f"{url}/{eid}")[2])["state"]) == "running":
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    assert state == "cancelled" and get(f"{url}/{eid}/file")[0] == 404
+    assert post(url, {"layers": ["bg"]})[0] == 202  # free again

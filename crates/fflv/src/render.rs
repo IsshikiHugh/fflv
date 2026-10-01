@@ -425,6 +425,10 @@ pub struct RenderOptions {
     /// Layers to show (default: the file's visible layers).
     pub layers: Option<Vec<String>>,
     pub hide: Vec<String>,
+    /// Layer opacities to use instead of the file's (layer id or index, 0–1).
+    pub opacity: Vec<(String, f32)>,
+    /// Draw order (layer ids or indices, bottom first) instead of z; layers not listed go on top.
+    pub order: Option<Vec<String>>,
     pub start: u32,
     pub end: Option<u32>,
     /// No background: RGBA output.
@@ -435,7 +439,16 @@ pub struct RenderOptions {
 
 impl Default for RenderOptions {
     fn default() -> Self {
-        RenderOptions { layers: None, hide: Vec::new(), start: 0, end: None, transparent: false, crf: 18 }
+        RenderOptions {
+            layers: None,
+            hide: Vec::new(),
+            opacity: Vec::new(),
+            order: None,
+            start: 0,
+            end: None,
+            transparent: false,
+            crf: 18,
+        }
     }
 }
 
@@ -472,7 +485,13 @@ fn drain(
 pub fn render(path: &Path, output: &str, o: &RenderOptions, progress: Option<Progress>) -> Result<u32> {
     let r = Reader::open(path)?;
     let end = o.end.unwrap_or(r.frame_count());
-    let frames = r.frames(o.start, Some(end), o.layers.as_deref(), &o.hide, o.transparent)?;
+    let mut frames = r.frames(o.start, Some(end), o.layers.as_deref(), &o.hide, o.transparent)?;
+    for (key, opacity) in &o.opacity {
+        frames.set_opacity(r.layer(key)?, *opacity);
+    }
+    if let Some(order) = &o.order {
+        frames.set_order(&order.iter().map(|k| r.layer(k)).collect::<Result<Vec<_>>>()?);
+    }
     let total = end.saturating_sub(o.start);
     let sink = open_sink(output, r.fps(), o.transparent, o.crf, total)?;
     drain(frames, sink, total, progress)

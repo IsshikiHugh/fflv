@@ -385,7 +385,7 @@ File ──► Reader (reads composite frames sequentially, read-ahead buffer)
 
 ### 9.8 UI
 - Play / pause, a progress bar (drag to seek), current time and frame number.
-- Layer panel: one row per layer showing its name, with a visibility toggle and an opacity slider.
+- Layer panel: one row per layer showing its name, with a visibility toggle and an opacity slider. Rows can be dragged (or moved up / down) to change the draw order the player uses instead of z; the file is not changed.
 - Frame step forward / backward (backward = seek to T-1).
 - Shortcuts: Space for play/pause, ← → for frame steps.
 - Debug panel (collapsible): current frame, ready-queue length, dropped frames, buffering events, number of P6 assertion failures.
@@ -539,7 +539,8 @@ The edit is instant whatever the file size. It works whenever the old and the ne
 **B.9 `fflv view`**. A local HTTP server (listening on 127.0.0.1 by default) serves the player and the file, with Range and ETag support. On a loopback address it answers only requests whose `Host` is a loopback name, so a web page cannot reach the file through DNS rebinding. A Range header that is not a single valid range is ignored (the whole file is sent, RFC 7233); an unsatisfiable one gets 416.
 - The ETag is derived from the file's inode, size and modification time, so it changes when the file is replaced (B.11) or rewritten in place (B.5). Each request opens the file once and takes the ETag, the size and the bytes from that one open file, so a response never mixes the ETag of one version with the bytes of another.
 - The player sends `If-Match` with every range read; when the file has been replaced, the server answers 412 and the player reloads instead.
-- The player polls the ETag once a second and reloads automatically when the file changes. A reload keeps the current frame, the play state, and the layer settings the user changed in the UI; everything else takes the new file's defaults.
+- The player polls the ETag once a second and reloads automatically when the file changes. A reload keeps the current frame, the play state, and the layer settings and the layer order the user changed in the UI; everything else takes the new file's defaults.
+- Export: the player can ask the server to render what it shows (its visible layers, their opacities, its layer order) to an MP4 / WebM / MOV / MKV file, which the browser then downloads (`POST /export`, progress at `GET /export/<id>`, the file at `GET /export/<id>/file`). Export requests must be `application/json`, so a page on another site cannot send one without a CORS preflight, which the server does not answer. One export runs at a time; its file is kept in the temporary directory until the next export starts or the server stops.
 - Polling continues after a failed load (for example a file caught half-written by a writer that does not follow B.11): the next version is loaded as soon as it appears, restoring the position and UI settings from before the failure.
 
 **B.10 Decoding in fflv** (`fflv.open` / `fflv render` / `fflv extract`) decodes only the selected layers, starting at the nearest RAP at or before the target frame, with one libvpx decoder per plane stream; the planes of a frame are decoded and converted in parallel. YUV→RGB uses the exact BT.601/709/2020 formulas as the stream signals them (not swscale, whose result depends on the frame width — when the width is not a multiple of 16, Y = 235 becomes 253 — and on the CPU), with 4:2:0 chroma taken nearest-neighbour. Compositing uses the same formulas as the WebGL player: straight alpha; layers scaled to their rect are sampled bilinearly like GL `LINEAR` with clamped edges; add is min(1, d + a·c); multiply / screen follow the W3C separable blend modes.

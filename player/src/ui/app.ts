@@ -3,6 +3,7 @@
  */
 import { formatTime, ptsUs } from '../format/timing';
 import { isActive, type LayerMeta } from '../format/lvf';
+import { moveTo } from '../format/order';
 import type { Player } from '../player';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -21,8 +22,8 @@ const usesSpace = (t: EventTarget | null) =>
   t instanceof HTMLElement && t.matches('button, a[href], summary, select, textarea, input:not([type=range])');
 const isTyping = (t: EventTarget | null) =>
   (t instanceof HTMLInputElement && t.type === 'text') || t instanceof HTMLTextAreaElement;
-/** Controls that use the arrow keys (and Home / End) themselves: the thumbnail background choice, the panel's resize handle. */
-const usesArrows = (t: EventTarget | null) => t instanceof HTMLElement && t.matches('input[type=radio], [role=separator]');
+/** Controls that use the arrow keys (and Home / End) themselves: the thumbnail background choice, the panel's resize handle, the export format. */
+const usesArrows = (t: EventTarget | null) => t instanceof HTMLElement && t.matches('input[type=radio], [role=separator], select');
 
 /** UI preferences kept in this browser; storage may be unavailable (private windows, blocked site data). */
 const pref = {
@@ -74,6 +75,7 @@ export function bindUi(player: Player): void {
   const layersEl = $<HTMLOListElement>('layers');
   const layerCount = $<HTMLSpanElement>('layer-count');
   const visAll = $<HTMLInputElement>('vis-all');
+  const orderReset = $<HTMLButtonElement>('order-reset');
   const debugList = $<HTMLDListElement>('debug-list');
   const debug = $<HTMLDetailsElement>('debug');
   const alphaFix = $<HTMLInputElement>('alpha-fix');
@@ -81,6 +83,10 @@ export function bindUi(player: Player): void {
   const side = document.querySelector<HTMLElement>('.side')!;
   const resizer = $<HTMLDivElement>('side-resize');
   const thumbBgs = [...document.querySelectorAll<HTMLInputElement>('input[name=thumb-bg]')];
+  const exportBox = $<HTMLDivElement>('export');
+  const exportFormat = $<HTMLSelectElement>('export-format');
+  const exportStatus = $<HTMLSpanElement>('export-status');
+  const btnExport = $<HTMLButtonElement>('btn-export');
 
   // ---- opening files ------------------------------------------------------------------------
   const open = (file: File) => {
@@ -267,6 +273,96 @@ export function bindUi(player: Player): void {
     });
   }
 
+  // ---- export (with `fflv view`) ------------------------------------------------------------------
+  // fflv renders the layers shown, at their opacities, to a video (like `fflv render`) and the page
+  // downloads it. Only for the file the server serves: a file opened here has no server behind it.
+  const EXPORT_POLL_MS = 400;
+  let exportMedia: string | null = null;
+  /** Id of the export being rendered. */
+  let exporting: number | null = null;
+  const exportMsg = (text: string, bad = false, title = text) => {
+    exportStatus.textContent = text;
+    exportStatus.title = title;
+    exportStatus.classList.toggle('bad', bad);
+  };
+  const updateExport = () => {
+    exportBox.hidden = exportMedia === null || player.sourceUrl !== exportMedia;
+    btnExport.disabled = exporting === null && !player.source;
+    btnExport.textContent = exporting === null ? 'Export video' : 'Cancel export';
+    exportFormat.disabled = exporting !== null;
+  };
+  const api = async (url: string, init?: RequestInit) => {
+    const r = await fetch(url, { cache: 'no-store', ...init });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error ?? `${r.status} ${r.statusText}`);
+    return body;
+  };
+  const download = (url: string) => {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = ''; // the server names the file
+    document.body.append(a);
+    a.click();
+    a.remove();
+  };
+  const startExport = async () => {
+    const source = player.source;
+    if (!source) return;
+    const format = exportFormat.value;
+    const shown = source.meta.layers.flatMap((L, i) => (player.layerStates[i].visible ? [[L.id, player.layerStates[i].opacity] as const] : []));
+    const order = player.layerOrder.map((i) => source.meta.layers[i].id);
+    const request = { format, layers: shown.map(([id]) => id), opacity: Object.fromEntries(shown), order };
+    const name = `${source.name.replace(/\.[^.]*$/, '') || 'export'}.${format}`;
+    try {
+      exportMsg('exporting…');
+      const { id } = await api('/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request) });
+      exporting = id;
+      updateExport();
+      for (;;) {
+        await new Promise((r) => window.setTimeout(r, EXPORT_POLL_MS));
+        const s = await api(`/export/${id}`);
+        if (s.state === 'running') {
+          exportMsg(s.total ? `exporting ${Math.floor((100 * s.done) / s.total)}% (${s.done}/${s.total})` : 'exporting…');
+          continue;
+        }
+        if (s.state === 'done') {
+          download(`/export/${id}/file`);
+          exportMsg(`exported ${name}`);
+        } else if (s.state === 'cancelled') {
+          exportMsg('export cancelled');
+        } else {
+          exportMsg(`export failed: ${String(s.error).split('\n')[0]}`, true, s.error);
+        }
+        break;
+      }
+    } catch (e) {
+      exportMsg(`export failed: ${(e as Error).message}`, true);
+    } finally {
+      exporting = null;
+      updateExport();
+    }
+  };
+  blurAfterMouse(btnExport);
+  btnExport.addEventListener('click', () => {
+    if (exporting === null) void startExport();
+    else void fetch(`/export/${exporting}/cancel`, { method: 'POST' });
+  });
+  exportFormat.addEventListener('change', () => {
+    pref.set('exportFormat', exportFormat.value);
+    exportFormat.blur(); // Space and the arrow keys drive the player again
+  });
+  // `fflv view` answers with what it can export; any other server (or none) does not.
+  void api('/export')
+    .then((info: { media?: string; formats?: string[] }) => {
+      if (!info.media || !info.formats?.length) return;
+      exportMedia = info.media;
+      for (const f of info.formats) exportFormat.add(new Option(f, f));
+      const saved = pref.get('exportFormat');
+      exportFormat.value = saved && info.formats.includes(saved) ? saved : info.formats[0];
+      updateExport();
+    })
+    .catch(() => {});
+
   // ---- layer panel ------------------------------------------------------------------------------
   /** Layer indices in panel order (top of the stack first); number keys follow this order. */
   let panelOrder: number[] = [];
@@ -344,8 +440,8 @@ export function bindUi(player: Player): void {
       return;
     }
     visAll.disabled = false;
-    panelOrder = meta.layers.map((_, i) => i).sort((a, b) => meta.layers[b].z - meta.layers[a].z || b - a);
-    for (const [row, i] of panelOrder.entries()) {
+    panelOrder = [...player.layerOrder].reverse();
+    for (const i of panelOrder) {
       const L = meta.layers[i];
       const st = player.layerStates[i];
       const li = document.createElement('li');
@@ -356,7 +452,6 @@ export function bindUi(player: Player): void {
       // eye: a checkbox drawn as an eye; Alt+click shows only this layer
       const eye = document.createElement('label');
       eye.className = 'eye';
-      eye.title = row < 9 ? `Show / hide (${row + 1}) · Alt+click: only this layer (Shift+${row + 1})` : 'Show / hide · Alt+click: only this layer';
       const vis = document.createElement('input');
       vis.type = 'checkbox';
       vis.className = 'vis';
@@ -380,14 +475,10 @@ export function bindUi(player: Player): void {
       thumbs.set(i, thumb.getContext('2d')!);
       const name = document.createElement('div');
       name.className = 'name';
-      if (row < 9) {
-        const key = document.createElement('span');
-        key.className = 'key';
-        key.textContent = String(row + 1);
-        name.append(key);
-      }
-      name.append(L.name || L.id);
-      name.title = L.id;
+      const key = document.createElement('span');
+      key.className = 'key';
+      name.append(key, L.name || L.id);
+      name.title = `${L.id} · drag to reorder`;
       const chev = document.createElement('span');
       chev.className = 'chev';
       chev.append(svg('', CHEVRON));
@@ -426,7 +517,36 @@ export function bindUi(player: Player): void {
         if (has(i)) player.setLayerOpacity(i, Number(slider.value) / 100);
       });
       op.append(label, slider, pct);
-      more.append(sub, op);
+      const move = document.createElement('div');
+      move.className = 'move';
+      const moveLabel = document.createElement('span');
+      moveLabel.textContent = 'order';
+      const up = document.createElement('button');
+      up.type = 'button';
+      up.className = 'mini move-up';
+      up.textContent = 'Move up';
+      up.addEventListener('click', () => moveBy(i, -1));
+      const down = document.createElement('button');
+      down.type = 'button';
+      down.className = 'mini move-down';
+      down.textContent = 'Move down';
+      down.addEventListener('click', () => moveBy(i, 1));
+      move.append(moveLabel, up, down);
+      more.append(sub, op, move);
+      // dragging the row moves the layer in the stack
+      main.draggable = true;
+      main.addEventListener('dragstart', (e) => {
+        dragged = i;
+        e.dataTransfer!.effectAllowed = 'move';
+        e.dataTransfer!.setData(DRAG_TYPE, String(i));
+        e.dataTransfer!.setDragImage(li, 20, 19);
+        li.classList.add('dragging');
+      });
+      main.addEventListener('dragend', () => {
+        dragged = null;
+        li.classList.remove('dragging');
+        showDrop(null);
+      });
       // clicking the row (not the eye) opens and closes the details
       main.addEventListener('click', (e) => {
         if (eye.contains(e.target as Node)) return;
@@ -436,9 +556,80 @@ export function bindUi(player: Player): void {
       li.append(main, more);
       layersEl.append(li);
     }
+    placeRows();
     updateLayerRows();
     scheduleThumbs();
   };
+
+  // ---- layer order ---------------------------------------------------------------------------------
+  // Drag a row (or use "Move up / down" in its details) to change the draw order, as in Photoshop.
+  // It changes what the player shows and exports, not the file; "reset order" goes back to its z order.
+  const DRAG_TYPE = 'application/x-lvf-layer';
+  let dragged: number | null = null;
+  const rows = () => [...(layersEl.children as HTMLCollectionOf<HTMLLIElement>)];
+  const rowOf = (i: number) => rows().find((li) => Number(li.dataset.index) === i);
+  /** Put the rows in panel order and number them (the number keys follow the panel). */
+  const placeRows = () => {
+    for (const [row, i] of panelOrder.entries()) {
+      const li = rowOf(i);
+      if (!li) continue;
+      layersEl.append(li);
+      const key = li.querySelector<HTMLSpanElement>('.key')!;
+      key.hidden = row >= 9;
+      key.textContent = String(row + 1);
+      li.querySelector<HTMLLabelElement>('.eye')!.title =
+        row < 9 ? `Show / hide (${row + 1}) · Alt+click: only this layer (Shift+${row + 1})` : 'Show / hide · Alt+click: only this layer';
+      li.querySelector<HTMLButtonElement>('.move-up')!.disabled = row === 0;
+      li.querySelector<HTMLButtonElement>('.move-down')!.disabled = row === panelOrder.length - 1;
+    }
+    orderReset.hidden = !player.orderChanged;
+  };
+  /** Put layer i at row `to` of the panel (top first). */
+  const moveToRow = (i: number, to: number) => {
+    if (!has(i)) return;
+    player.setLayerOrder(moveTo(panelOrder, i, to).reverse());
+  };
+  const moveBy = (i: number, delta: number) => {
+    const row = panelOrder.indexOf(i);
+    moveToRow(i, row + delta);
+    rowOf(i)?.querySelector<HTMLButtonElement>(delta < 0 ? '.move-up' : '.move-down')?.focus(); // keep the keyboard user's place
+  };
+  /** Where a drop at clientY would put the dragged row: a row index of the panel without it. */
+  const dropRow = (y: number) => {
+    const others = rows().filter((li) => Number(li.dataset.index) !== dragged);
+    const k = others.findIndex((li) => {
+      const r = li.getBoundingClientRect();
+      return y < r.top + r.height / 2;
+    });
+    return k < 0 ? others.length : k;
+  };
+  /** The insertion line: above row `to` of the panel without the dragged row (or below the last). */
+  const showDrop = (to: number | null) => {
+    const others = rows().filter((li) => Number(li.dataset.index) !== dragged);
+    for (const li of rows()) li.classList.remove('drop-above', 'drop-below');
+    if (to === null || !others.length) return;
+    if (to < others.length) others[to].classList.add('drop-above');
+    else others[others.length - 1].classList.add('drop-below');
+  };
+  layersEl.addEventListener('dragover', (e) => {
+    if (dragged === null || !e.dataTransfer?.types.includes(DRAG_TYPE)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    showDrop(dropRow(e.clientY));
+  });
+  layersEl.addEventListener('dragleave', (e) => {
+    if (!layersEl.contains(e.relatedTarget as Node | null)) showDrop(null);
+  });
+  layersEl.addEventListener('drop', (e) => {
+    if (dragged === null || !e.dataTransfer?.types.includes(DRAG_TYPE)) return;
+    e.preventDefault();
+    e.stopPropagation(); // not a file drop
+    const i = dragged;
+    showDrop(null);
+    moveToRow(i, dropRow(e.clientY));
+  });
+  blurAfterMouse(orderReset);
+  orderReset.addEventListener('click', () => player.setLayerOrder(null));
 
   const updateLayerRows = () => {
     const meta = player.source?.meta;
@@ -547,10 +738,12 @@ export function bindUi(player: Player): void {
     buildLayers();
     updateStatus();
     updateBanner();
+    updateExport();
     player.audio?.setVolume(mute.checked ? 0 : 1);
   });
   player.addEventListener('state', () => {
     updateStatus();
+    updateExport();
     updateTransport();
     if (player.mode === 'error') buildLayers(); // a failed load leaves no layers; the rows stay during a reload
   });
@@ -560,6 +753,10 @@ export function bindUi(player: Player): void {
     scheduleThumbs();
   });
   player.addEventListener('layers', updateLayerRows);
+  player.addEventListener('order', () => {
+    panelOrder = [...player.layerOrder].reverse();
+    placeRows();
+  });
   player.addEventListener('sync-failure', updateBanner);
   window.setInterval(updateDebug, 250);
   debug.addEventListener('toggle', updateDebug);

@@ -8,17 +8,31 @@
 //! Each request opens the file once and takes the ETag, the size and the bytes from that one open
 //! file, so a response can never mix the ETag of one version with the bytes of another — even
 //! while the file is being replaced (writers rename a finished file over it, spec B.11).
+//!
+//! The player can also export what it shows (its visible layers, at their opacities) to a video:
+//!   GET  /export              {"media", "formats"}: what this server can export
+//!   POST /export              {"format", "layers": [id...], "opacity": {id: 0–1}, "order": [id...]}
+//!                             → {"id"}; one at a time. "order" is the draw order, bottom first.
+//!   GET  /export/ID           {"state": running | done | failed | cancelled, "done", "total", "error"}
+//!   GET  /export/ID/file      the finished video, as a download named after the .lvd
+//!   POST /export/ID/cancel
+//! The video is rendered by [`render`] (like `fflv render`) into a temporary file, which is kept
+//! until the next export or until the server stops.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use serde_json::{json, Value};
 
 use include_dir::{include_dir, Dir};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::error::{Error, Result};
+use crate::render::{render, RenderOptions};
 
 /// The built player (player/, `npm run build`).
 static VIEWER: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/viewer");
@@ -96,7 +110,12 @@ pub struct ViewServer {
     /// Listening on a loopback address: only accept requests addressed to it (a page elsewhere
     /// must not reach the file through DNS rebinding).
     loopback_only: bool,
+    /// The current (or last) export; shared with the thread that renders it.
+    export: Arc<Mutex<Option<Export>>>,
 }
+
+/// Export ids, unique in the process (they also name the temporary files).
+static NEXT_EXPORT: AtomicU64 = AtomicU64::new(1);
 
 /// A started server (see [`ViewServer::start`]).
 pub struct Running {
@@ -176,7 +195,14 @@ impl ViewServer {
         })?;
         let media_name = media.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let loopback_only = is_loopback_name(&host.to_ascii_lowercase());
-        Ok(ViewServer { server: Arc::new(server), media, media_name, quiet, loopback_only })
+        Ok(ViewServer {
+            server: Arc::new(server),
+            media,
+            media_name,
+            quiet,
+            loopback_only,
+            export: Arc::new(Mutex::new(None)),
+        })
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -228,6 +254,10 @@ impl ViewServer {
                 let _ = req.respond(Response::empty(403));
                 return;
             }
+        }
+        if path == "/export" || path.starts_with("/export/") {
+            let _ = self.handle_export(req, &path);
+            return;
         }
         if !matches!(req.method(), Method::Get | Method::Head) {
             let _ = req.respond(Response::empty(405).with_header(header("Allow", "GET, HEAD")));
@@ -293,6 +323,232 @@ impl ViewServer {
             resp = resp.with_header(header("Content-Range", &format!("bytes {start}-{}/{size}", end - 1)));
         }
         req.respond(media_headers(resp, &etag))
+    }
+}
+
+impl Drop for ViewServer {
+    fn drop(&mut self) {
+        if let Some(e) = self.export.lock().unwrap().take() {
+            let _ = fs::remove_file(&e.path);
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Export
+// ------------------------------------------------------------------------------------------------
+
+/// Video formats the player can export to (the extension picks the codec, see `render`).
+const EXPORT_FORMATS: &[(&str, &str)] =
+    &[("mp4", "video/mp4"), ("webm", "video/webm"), ("mov", "video/quicktime"), ("mkv", "video/x-matroska")];
+
+/// Largest export request accepted (it lists layer ids and opacities).
+const MAX_EXPORT_REQUEST: u64 = 1 << 20;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExportState {
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+struct Export {
+    id: u64,
+    state: ExportState,
+    error: Option<String>,
+    done: u32,
+    total: u32,
+    cancel: bool,
+    path: PathBuf,
+    format: &'static str,
+}
+
+impl Export {
+    fn status(&self) -> Value {
+        let state = match self.state {
+            ExportState::Running => "running",
+            ExportState::Done => "done",
+            ExportState::Failed => "failed",
+            ExportState::Cancelled => "cancelled",
+        };
+        json!({"id": self.id, "state": state, "done": self.done, "total": self.total, "error": self.error})
+    }
+}
+
+/// `{"format", "layers", "opacity", "order"}` → the output format and what to render.
+fn parse_export(body: &[u8]) -> std::result::Result<(&'static str, RenderOptions), String> {
+    let v: Value = serde_json::from_slice(body).map_err(|e| format!("not JSON: {e}"))?;
+    let format = v.get("format").and_then(Value::as_str).unwrap_or("mp4");
+    let Some(&(format, _)) = EXPORT_FORMATS.iter().find(|(f, _)| *f == format) else {
+        return Err(format!("unsupported format {format:?}"));
+    };
+    let mut opacity = Vec::new();
+    if let Some(o) = v.get("opacity").filter(|o| !o.is_null()) {
+        let o = o.as_object().ok_or("\"opacity\" must map layer ids to numbers")?;
+        for (k, a) in o {
+            let a = a.as_f64().filter(|a| (0.0..=1.0).contains(a)).ok_or("opacities must be numbers from 0 to 1")?;
+            opacity.push((k.clone(), a as f32));
+        }
+    }
+    let ids = |key: &str| -> std::result::Result<Option<Vec<String>>, String> {
+        match v.get(key).filter(|o| !o.is_null()) {
+            None => Ok(None),
+            Some(o) => o
+                .as_array()
+                .and_then(|a| a.iter().map(|l| l.as_str().map(String::from)).collect())
+                .map(Some)
+                .ok_or_else(|| format!("\"{key}\" must be a list of layer ids")),
+        }
+    };
+    let layers = ids("layers")?.ok_or("\"layers\" must be a list of layer ids")?;
+    let order = ids("order")?;
+    Ok((format, RenderOptions { layers: Some(layers), opacity, order, ..Default::default() }))
+}
+
+/// A file name for a header: the name itself (RFC 5987) and an ASCII fallback.
+fn content_disposition(name: &str) -> String {
+    let ascii: String =
+        name.chars().map(|c| if c.is_ascii_graphic() && c != '"' && c != '\\' || c == ' ' { c } else { '_' }).collect();
+    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{}", percent_encode(name))
+}
+
+fn json_response(status: u16, v: &Value) -> Response<std::io::Cursor<Vec<u8>>> {
+    Response::from_data(v.to_string().into_bytes())
+        .with_status_code(status)
+        .with_header(header("Content-Type", "application/json"))
+        .with_header(header("Cache-Control", "no-store"))
+}
+
+fn json_error(status: u16, msg: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    json_response(status, &json!({ "error": msg }))
+}
+
+impl ViewServer {
+    fn handle_export(&self, mut req: Request, path: &str) -> std::io::Result<()> {
+        let rest: Vec<&str> = path.trim_start_matches("/export").trim_start_matches('/').split('/').collect();
+        let method = req.method().clone();
+        let id = rest[0].parse::<u64>().ok();
+        match (&method, rest.as_slice()) {
+            (Method::Get, [""]) => {
+                let formats: Vec<&str> = EXPORT_FORMATS.iter().map(|(f, _)| *f).collect();
+                let media = format!("/media/{}", percent_encode(&self.media_name));
+                req.respond(json_response(200, &json!({ "media": media, "formats": formats })))
+            }
+            (Method::Post, [""]) => {
+                // Only JSON: a page on another site cannot send that without a CORS preflight,
+                // which this server does not answer.
+                let is_json = req
+                    .headers()
+                    .iter()
+                    .any(|h| h.field.equiv("Content-Type") && h.value.as_str().starts_with("application/json"));
+                if !is_json {
+                    return req.respond(json_error(415, "send the export request as application/json"));
+                }
+                let mut body = Vec::new();
+                req.as_reader().take(MAX_EXPORT_REQUEST + 1).read_to_end(&mut body)?;
+                if body.len() as u64 > MAX_EXPORT_REQUEST {
+                    return req.respond(json_error(413, "export request too large"));
+                }
+                match parse_export(&body) {
+                    Ok((format, opts)) => match self.start_export(format, opts) {
+                        Ok(id) => req.respond(json_response(202, &json!({ "id": id }))),
+                        Err(msg) => req.respond(json_error(409, &msg)),
+                    },
+                    Err(msg) => req.respond(json_error(400, &msg)),
+                }
+            }
+            (Method::Get, [_]) => match self.export.lock().unwrap().as_ref().filter(|e| Some(e.id) == id) {
+                Some(e) => req.respond(json_response(200, &e.status())),
+                None => req.respond(json_error(404, "no such export")),
+            },
+            (Method::Post, [_, "cancel"]) => {
+                let status = self.export.lock().unwrap().as_mut().filter(|e| Some(e.id) == id).map(|e| {
+                    e.cancel = e.state == ExportState::Running;
+                    e.status()
+                });
+                match status {
+                    Some(s) => req.respond(json_response(200, &s)),
+                    None => req.respond(json_error(404, "no such export")),
+                }
+            }
+            (Method::Get | Method::Head, [_, "file"]) => {
+                let done = self
+                    .export
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|e| Some(e.id) == id && e.state == ExportState::Done)
+                    .map(|e| (e.path.clone(), e.format));
+                let Some((file, format)) = done else { return req.respond(json_error(404, "no such finished export")) };
+                let Ok(f) = File::open(&file) else { return req.respond(json_error(404, "the exported file is gone")) };
+                let mime =
+                    EXPORT_FORMATS.iter().find(|(f, _)| *f == format).map_or("application/octet-stream", |(_, m)| m);
+                let stem = Path::new(&self.media_name).file_stem().map_or("export".into(), |s| s.to_string_lossy());
+                req.respond(
+                    Response::from_file(f)
+                        .with_header(header("Content-Type", mime))
+                        .with_header(header("Content-Disposition", &content_disposition(&format!("{stem}.{format}"))))
+                        .with_header(header("Cache-Control", "no-store"))
+                        .with_chunked_threshold(usize::MAX),
+                )
+            }
+            _ => req.respond(json_error(404, "unknown export request")),
+        }
+    }
+
+    /// Start rendering in the background; Err when another export is still running.
+    fn start_export(&self, format: &'static str, opts: RenderOptions) -> std::result::Result<u64, String> {
+        let mut slot = self.export.lock().unwrap();
+        if slot.as_ref().is_some_and(|e| e.state == ExportState::Running) {
+            return Err("an export is already running".into());
+        }
+        if let Some(old) = slot.take() {
+            let _ = fs::remove_file(&old.path);
+        }
+        let id = NEXT_EXPORT.fetch_add(1, Ordering::Relaxed);
+        let out = std::env::temp_dir().join(format!("fflv-export-{}-{id}.{format}", std::process::id()));
+        *slot = Some(Export {
+            id,
+            state: ExportState::Running,
+            error: None,
+            done: 0,
+            total: 0,
+            cancel: false,
+            path: out.clone(),
+            format,
+        });
+        let (jobs, media) = (self.export.clone(), self.media.clone());
+        std::thread::spawn(move || {
+            let mut progress = |done: u32, total: u32| -> Result<()> {
+                let mut slot = jobs.lock().unwrap();
+                match slot.as_mut().filter(|e| e.id == id) {
+                    Some(e) if !e.cancel => {
+                        (e.done, e.total) = (done, total);
+                        Ok(())
+                    }
+                    _ => Err(Error::Output("export cancelled".into())),
+                }
+            };
+            let result = render(&media, &out.to_string_lossy(), &opts, Some(&mut progress));
+            let mut slot = jobs.lock().unwrap();
+            let Some(e) = slot.as_mut().filter(|e| e.id == id) else {
+                let _ = fs::remove_file(&out);
+                return;
+            };
+            e.state = match result {
+                Ok(_) => ExportState::Done,
+                Err(_) if e.cancel => ExportState::Cancelled,
+                Err(err) => {
+                    e.error = Some(err.to_string());
+                    ExportState::Failed
+                }
+            };
+            if e.state != ExportState::Done {
+                let _ = fs::remove_file(&out);
+            }
+        });
+        Ok(id)
     }
 }
 
@@ -402,6 +658,29 @@ mod tests {
     fn percent_coding() {
         assert_eq!(percent_decode("a%20b%2F.lvd"), "a b/.lvd");
         assert_eq!(percent_encode("a b.lvd"), "a%20b.lvd");
+    }
+
+    #[test]
+    fn export_requests() {
+        let (format, o) =
+            parse_export(br#"{"format": "webm", "layers": ["bg", "1"], "opacity": {"bg": 0.5}}"#).unwrap();
+        assert_eq!(format, "webm");
+        assert_eq!(o.layers, Some(vec!["bg".to_string(), "1".to_string()]));
+        assert_eq!(o.opacity, vec![("bg".to_string(), 0.5)]);
+        assert!(!o.transparent && o.start == 0 && o.end.is_none() && o.order.is_none());
+        let (_, o) = parse_export(br#"{"layers": ["a"], "order": ["b", "a"]}"#).unwrap();
+        assert_eq!(o.order, Some(vec!["b".to_string(), "a".to_string()]));
+        assert!(parse_export(br#"{"layers": [], "order": "a"}"#).is_err());
+        assert_eq!(parse_export(br#"{"layers": []}"#).unwrap().0, "mp4");
+        assert!(parse_export(br#"{"format": "gif", "layers": []}"#).is_err());
+        assert!(parse_export(br#"{"format": "mp4"}"#).is_err());
+        assert!(parse_export(br#"{"layers": [1]}"#).is_err());
+        assert!(parse_export(br#"{"layers": [], "opacity": {"bg": 2}}"#).is_err());
+        assert!(parse_export(b"layers").is_err());
+        assert_eq!(
+            content_disposition("débug \"a\".mp4"),
+            "attachment; filename=\"d_bug _a_.mp4\"; filename*=UTF-8''d%C3%A9bug%20%22a%22.mp4"
+        );
     }
 
     #[test]

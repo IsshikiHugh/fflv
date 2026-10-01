@@ -35,6 +35,14 @@ button { font: inherit; color: inherit; }
 .btn { background: var(--accent); color: var(--accent-ink); padding: 7px 14px; border: 0; border-radius: 6px; cursor: pointer; font-weight: 600; }
 .btn:hover { filter: brightness(1.1); }
 .btn.ghost { background: var(--panel-3); color: var(--text); }
+.btn:disabled { opacity: 0.5; cursor: default; filter: none; }
+
+/* Export (only with `fflv view`): format, button, progress / result. */
+.export { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.export-status { color: var(--dim); font-family: var(--mono); font-size: 12px; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#btn-export { min-width: 124px; }
+.export-status.bad { color: var(--danger); }
+.export-format { background: var(--panel-3); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 6px; font: inherit; font-size: 13px; }
 
 /* The layer panel is as wide as --side-w (dragged by the user), but always leaves the video some room. */
 .layout { --side-col: clamp(240px, var(--side-w, 300px), calc(100vw - 360px)); position: relative; flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) var(--side-col); }
@@ -131,6 +139,18 @@ body.resizing { cursor: col-resize; user-select: none; }
 .layer .opacity span { width: 38px; text-align: right; font-family: var(--mono); font-size: 11px; }
 /* Hidden by the user: dimmed. Not active in this frame: dashed frame and a note in the details. */
 .layer.hidden .name, .layer.hidden .thumb { opacity: 0.45; }
+.layer .move { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--dim); }
+.layer .move span { margin-right: 4px; }
+.mini { padding: 2px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel-3); font-size: 11px; cursor: pointer; }
+.mini:hover:not(:disabled) { border-color: var(--dim); }
+.mini:disabled { opacity: 0.4; cursor: default; }
+/* Reordering: the dragged row fades, a line shows where it will go. */
+.layer .row[draggable=true] { cursor: grab; }
+.layer.dragging { opacity: 0.4; }
+.layer.drop-above { box-shadow: 0 -2px 0 0 var(--accent); }
+.layer.drop-below { box-shadow: 0 2px 0 0 var(--accent); }
+.link { padding: 0; border: 0; background: none; color: var(--accent); font-size: 11px; cursor: pointer; }
+.link:hover { text-decoration: underline; }
 .layer.inactive { border-color: var(--line); border-style: dashed; background: transparent; }
 .layer.inactive .thumb { opacity: 0.35; }
 .layer.inactive .name { color: var(--dim); }

@@ -1,6 +1,6 @@
 /**
  * WebGL2 compositor (spec 9.6). Draws one composite frame: every visible layer that is active in
- * that frame, in ascending z, as a textured rectangle at its canvas rect.
+ * that frame, in ascending z (or the order set with setOrder), as a textured rectangle at its canvas rect.
  *
  *  - Color planes are uploaded straight from the VideoFrame (the browser converts YUV → RGB).
  *  - Alpha planes arrive as raw coded luma and are uploaded as R8. Limited-range alpha (Y 16..235,
@@ -14,6 +14,7 @@
  */
 import type { CompositeFrame, LumaPlane } from '../decode/frames';
 import { isActive, type BlendMode, type LvfMeta } from '../format/lvf';
+import { zOrder } from '../format/order';
 
 export interface LayerState {
   visible: boolean;
@@ -114,7 +115,7 @@ export class Compositor {
     this.canvas.height = meta.canvas.height;
     const hex = meta.canvas.background;
     this.bg = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255) as [number, number, number];
-    this.order = meta.layers.map((_, i) => i).sort((a, b) => meta.layers[a].z - meta.layers[b].z || a - b);
+    this.order = zOrder(meta.layers);
     const gl = this.gl;
     for (const [i, L] of meta.layers.entries()) {
       if (L.kind === 'video') {
@@ -129,6 +130,11 @@ export class Compositor {
         this.stills.set(i, tex);
       }
     }
+  }
+
+  /** Draw the layers in this order (layer indices, bottom first) instead of the file's z order. */
+  setOrder(order: readonly number[]): void {
+    this.order = [...order];
   }
 
   /**

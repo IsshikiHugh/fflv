@@ -634,7 +634,7 @@ fn render_file(
     progress: Option<Py<PyAny>>,
 ) -> PyResult<u32> {
     clear_callback_error();
-    let o = RenderOptions { layers, hide, start, end, transparent, crf };
+    let o = RenderOptions { layers, hide, start, end, transparent, crf, ..Default::default() };
     let mut p = progress_fn(progress);
     py.detach(|| render::render(&path, &output, &o, Some(&mut p))).map_err(py_err)
 }

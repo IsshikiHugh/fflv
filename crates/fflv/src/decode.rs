@@ -414,6 +414,21 @@ pub struct Frames {
     transparent: bool,
 }
 
+impl Frames {
+    /// Draw the layers in this order (layer indices, bottom first) instead of by z; layers shown
+    /// but not listed are drawn above them, by z.
+    pub fn set_order(&mut self, order: &[usize]) {
+        self.draw.sort_by_key(|d| order.iter().position(|&i| i == d.index).unwrap_or(usize::MAX));
+    }
+
+    /// Draw layer `index` (if it is shown) with this opacity instead of its own.
+    pub fn set_opacity(&mut self, index: usize, opacity: f32) {
+        for d in self.draw.iter_mut().filter(|d| d.index == index) {
+            d.opacity = opacity.clamp(0.0, 1.0);
+        }
+    }
+}
+
 impl Iterator for Frames {
     type Item = Result<(u32, Image)>;
     fn next(&mut self) -> Option<Self::Item> {

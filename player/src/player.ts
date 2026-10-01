@@ -17,6 +17,7 @@ import { DecodePipeline, type PipelineOptions } from './decode/pipeline';
 import { CompositeFrame, frameStats } from './decode/frames';
 import { HttpByteSource, SourceChangedError } from './format/bytes';
 import { isActive, type StillLayerMeta } from './format/lvf';
+import { mergeOrder, sameOrder, zOrder } from './format/order';
 import { LvfSource } from './format/source';
 import { frameAtUs, ptsUs } from './format/timing';
 import { Compositor, type LayerState } from './render/compositor';
@@ -52,13 +53,15 @@ export interface PlayerOptions {
 }
 
 /**
- * What survives a reload of a changed file: position, play state, and the layer settings changed in
- * the UI (by layer id). Settings left at the file's defaults follow the new file.
+ * What survives a reload of a changed file: position, play state, and the layer settings and order
+ * changed in the UI (by layer id). Settings left at the file's defaults follow the new file.
  */
 interface KeptState {
   frame: number;
   playing: boolean;
   overrides: Map<string, Partial<LayerState>>;
+  /** Layer ids, bottom first, when the order was changed in the UI. */
+  order: string[] | null;
 }
 
 type Origin = { kind: 'blob'; blob: Blob; name?: string } | { kind: 'url'; url: string; name?: string };
@@ -75,6 +78,8 @@ export class Player extends EventTarget {
   mode: PlayerMode = 'empty';
   current: CompositeFrame | null = null;
   layerStates: LayerState[] = [];
+  /** Draw order: layer indices, bottom first (the file's z order unless changed in the UI). */
+  layerOrder: number[] = [];
   loop = false;
   error: Error | null = null;
   notice: string | null = null;
@@ -141,6 +146,10 @@ export class Player extends EventTarget {
       this.pipeline = pipeline;
       pipeline.onError = (e) => this.fail(e);
       this.layerStates = source.meta.layers.map((L) => ({ visible: L.visible, opacity: L.opacity, ...keep?.overrides.get(L.id) }));
+      const fileOrder = zOrder(source.meta.layers);
+      const ids = source.meta.layers.map((L) => L.id);
+      this.layerOrder = keep?.order ? mergeOrder(fileOrder, ids, keep.order) : fileOrder;
+      this.compositor.setOrder(this.layerOrder);
       this.emit('loaded');
       this.startSeek(Math.min(keep?.frame ?? 0, source.frameCount - 1), keep?.playing ?? false);
     } catch (e) {
@@ -163,7 +172,9 @@ export class Player extends EventTarget {
       if (s.opacity !== L.opacity) o.opacity = s.opacity;
       if (Object.keys(o).length) overrides.set(L.id, o);
     });
-    return { frame: this.targetFrame, playing: this.isPlaying, overrides };
+    const layers = this.source?.meta.layers ?? [];
+    const order = this.orderChanged ? this.layerOrder.map((i) => layers[i].id) : null;
+    return { frame: this.targetFrame, playing: this.isPlaying, overrides, order };
   }
 
   /**
@@ -226,6 +237,11 @@ export class Player extends EventTarget {
     this.lastSyncFailure = null;
     this.dirty = true;
     this.setMode('empty');
+  }
+
+  /** The URL the file was opened from (`fflv view`), or null for a local file. */
+  get sourceUrl(): string | null {
+    return this.origin?.kind === 'url' ? this.origin.url : null;
   }
 
   get frameCount(): number {
@@ -321,6 +337,26 @@ export class Player extends EventTarget {
     this.layerStates[i].opacity = Math.max(0, Math.min(1, opacity));
     this.dirty = true;
     this.emit('layers');
+  }
+
+  /** Draw the layers in this order (layer indices, bottom first); `null`: the file's z order. */
+  setLayerOrder(order: readonly number[] | null): void {
+    const layers = this.source?.meta.layers;
+    if (!layers) return;
+    const next = order ? [...order] : zOrder(layers);
+    if (next.length !== layers.length || !sameOrder([...next].sort((a, b) => a - b), layers.map((_, i) => i))) {
+      throw new Error(`not an order of the ${layers.length} layers: ${next}`);
+    }
+    if (sameOrder(next, this.layerOrder)) return;
+    this.layerOrder = next;
+    this.compositor.setOrder(next);
+    this.dirty = true;
+    this.emit('order');
+  }
+
+  /** The order differs from the file's z order. */
+  get orderChanged(): boolean {
+    return !!this.source && !sameOrder(this.layerOrder, zOrder(this.source.meta.layers));
   }
 
   /** Draw the current composite frame again (after a compositor setting changed). */
