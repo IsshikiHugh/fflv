@@ -39,11 +39,15 @@ impl LayerFrame {
 
     /// RGBA (opaque when the layer has no alpha).
     pub fn to_rgba(&self) -> Image {
-        let n = (self.width * self.height) as usize;
-        let mut data = Vec::with_capacity(n * 4);
-        for i in 0..n {
-            data.extend_from_slice(&self.rgb[i * 3..i * 3 + 3]);
-            data.push(self.alpha.as_ref().map_or(255, |a| a[i]));
+        let n = self.width as usize * self.height as usize;
+        let mut data = vec![255u8; n * 4];
+        for (o, p) in data.chunks_exact_mut(4).zip(self.rgb.chunks_exact(3)) {
+            o[..3].copy_from_slice(p);
+        }
+        if let Some(alpha) = &self.alpha {
+            for (o, &a) in data.chunks_exact_mut(4).zip(alpha) {
+                o[3] = a;
+            }
         }
         Image { width: self.width, height: self.height, channels: 4, data }
     }
@@ -175,13 +179,17 @@ impl Reader {
         let rap = self.rap_at_or_before(start);
         let from = self.offsets[rap as usize];
         let to = if end < self.frame_count() { self.offsets[end as usize] } else { self.file.header.index_offset };
+        // the streams decode in parallel: share the cores between them
+        let streams: usize = want.iter().map(|&i| 1 + self.meta.layers[i].has_alpha() as usize).sum();
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let threads = (cores / streams.max(1)).clamp(1, 8) as u32;
         let planes = want
             .iter()
             .map(|&i| {
                 let l = &self.meta.layers[i];
-                let color = Decoder::new(1, &format!("layer {:?} color", l.id))?;
+                let color = Decoder::new(threads, &format!("layer {:?} color", l.id))?;
                 let alpha =
-                    if l.has_alpha() { Some(Decoder::new(1, &format!("layer {:?} alpha", l.id))?) } else { None };
+                    if l.has_alpha() { Some(Decoder::new(threads, &format!("layer {:?} alpha", l.id))?) } else { None };
                 let (w, h) = l.content_size();
                 Ok(LayerDecoder { index: i, width: w, height: h, full: l.alpha_full_range(), color, alpha })
             })
@@ -229,6 +237,7 @@ impl Reader {
             stills,
             width: w,
             height: h,
+            canvas: Canvas::new(w, h, background),
             background,
             transparent,
         })
@@ -257,11 +266,19 @@ impl Reader {
     }
 }
 
+/// Largest canvas / coded width or height decoding accepts (the compositing canvas takes 16 bytes
+/// per pixel).
+const MAX_SIDE: u32 = 16384;
+
 /// What decoding relies on in the metadata (the validator checks much more).
 fn check_layers(meta: &Meta) -> Result<()> {
+    let (w, h) = (meta.canvas.width, meta.canvas.height);
+    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
+        return Err(Error::Decode(format!("unsupported canvas size {w}x{h} (at most {MAX_SIDE}x{MAX_SIDE})")));
+    }
     for l in meta.layers.iter().filter(|l| l.is_video()) {
         let ((cw, ch), (w, h)) = (l.coded_size(), l.content_size());
-        if cw == 0 || ch == 0 || cw > 16384 || ch > 16384 || w == 0 || h == 0 || w > cw || h > ch {
+        if cw == 0 || ch == 0 || cw > MAX_SIDE || ch > MAX_SIDE || w == 0 || h == 0 || w > cw || h > ch {
             return Err(Error::Decode(format!(
                 "layer {:?}: bad coded size {cw}x{ch} / content size {w}x{h} (run `fflv check`)",
                 l.id
@@ -294,6 +311,13 @@ impl LayerDecoder {
             }
             Ok(())
         };
+        if self.alpha.is_some() && alpha.is_empty() {
+            // the alpha stream would lose a frame and with it its references (spec 5.2)
+            return Err(Error::Decode(format!(
+                "layer {}: a frame without alpha data in a layer with alpha (run `fflv check`)",
+                self.index
+            )));
+        }
         let (cdec, adec) = (&mut self.color, &mut self.alpha);
         let (rgb, a) = rayon::join(
             || -> Result<Option<Vec<u8>>> {
@@ -307,7 +331,7 @@ impl LayerDecoder {
             },
             || -> Result<Option<Vec<u8>>> {
                 match adec {
-                    Some(d) if !alpha.is_empty() => {
+                    Some(d) => {
                         let f = d.decode(alpha)?;
                         fits(&f, "alpha")?;
                         Ok(convert.then(|| {
@@ -316,7 +340,7 @@ impl LayerDecoder {
                             out
                         }))
                     }
-                    _ => Ok(None),
+                    None => Ok(None),
                 }
             },
         );
@@ -410,6 +434,8 @@ pub struct Frames {
     stills: HashMap<usize, Arc<Image>>,
     width: u32,
     height: u32,
+    /// reused from frame to frame
+    canvas: Canvas,
     background: Option<[u8; 3]>,
     transparent: bool,
 }
@@ -436,7 +462,7 @@ impl Iterator for Frames {
             Ok(x) => x,
             Err(e) => return Some(Err(e)),
         };
-        let mut cv = Canvas::new(self.width, self.height, self.background);
+        let mut shown: Vec<(&Draw, Pixels)> = Vec::new();
         for d in &self.draw {
             if !(d.start <= f && f < d.end) {
                 continue;
@@ -449,7 +475,25 @@ impl Iterator for Frames {
             } else {
                 Pixels::rgba(&self.stills[&d.index])
             };
-            cv.draw(&px, d.rect, d.blend, d.opacity);
+            shown.push((d, px));
+        }
+        // one opaque layer drawn 1:1 over the whole canvas: compositing would give its pixels back
+        let (w, h) = (self.width, self.height);
+        if let [(d, px)] = shown.as_slice() {
+            if d.blend == Blend::Normal
+                && d.opacity == 1.0
+                && d.rect == (lvf::Rect { x: 0, y: 0, w, h })
+                && (px.width, px.height) == (w, h)
+                && matches!(px.channels, 3 | 4)
+                && px.is_opaque()
+            {
+                return Some(Ok((f, px.opaque_image(self.transparent))));
+            }
+        }
+        let cv = &mut self.canvas;
+        cv.clear(self.background);
+        for (d, px) in &shown {
+            cv.draw(px, d.rect, d.blend, d.opacity);
         }
         Some(Ok((f, cv.image(self.transparent))))
     }

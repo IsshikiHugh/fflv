@@ -63,6 +63,38 @@ impl<'a> Pixels<'a> {
         };
         [c[0] as f32, c[1] as f32, c[2] as f32, a as f32]
     }
+
+    /// Every pixel is fully opaque.
+    pub fn is_opaque(&self) -> bool {
+        let n = self.width as usize * self.height as usize;
+        match (self.alpha, self.channels) {
+            (Some(a), _) => a[..n].iter().all(|&v| v == 255),
+            (None, 4) => self.color[..n * 4].chunks_exact(4).all(|p| p[3] == 255),
+            _ => true,
+        }
+    }
+
+    /// The colors (3 or 4 channels) as RGB, or as RGBA with alpha 255 (`with_alpha`): what
+    /// drawing opaque pixels 1:1 with normal blend and opacity 1 over a whole canvas of the same
+    /// size gives, without the canvas.
+    pub fn opaque_image(&self, with_alpha: bool) -> Image {
+        let (w, n, c) = (self.width as usize, self.width as usize * self.height as usize, self.channels);
+        debug_assert!(matches!(c, 3 | 4));
+        let src = &self.color[..n * c];
+        let oc = if with_alpha { 4 } else { 3 };
+        let data = if c == oc && !with_alpha {
+            src.to_vec()
+        } else {
+            let mut out = vec![255u8; n * oc];
+            out.par_chunks_mut((w * oc).max(1)).zip(src.par_chunks((w * c).max(1))).for_each(|(o, s)| {
+                for (o, s) in o.chunks_exact_mut(oc).zip(s.chunks_exact(c)) {
+                    o[..3].copy_from_slice(&s[..3]);
+                }
+            });
+            out
+        };
+        Image { width: self.width, height: self.height, channels: oc as u8, data }
+    }
 }
 
 /// Sampling positions along one axis: (i0, i1, weight of i1) per destination pixel, like GL
@@ -94,14 +126,29 @@ impl Canvas {
     /// Opaque `background`, or transparent (None).
     pub fn new(width: u32, height: u32, background: Option<[u8; 3]>) -> Canvas {
         let n = width as usize * height as usize;
-        let (color, alpha) = match background {
+        let mut cv = Canvas { width, height, color: vec![0.0; n * 3], alpha: vec![0.0; n] };
+        cv.clear(background);
+        cv
+    }
+
+    /// Start over with an opaque `background`, or transparent (None), keeping the buffers.
+    pub fn clear(&mut self, background: Option<[u8; 3]>) {
+        let w = (self.width as usize).max(1);
+        match background {
             Some(bg) => {
                 let px = [bg[0] as f32 / 255.0, bg[1] as f32 / 255.0, bg[2] as f32 / 255.0];
-                (px.repeat(n), vec![1.0; n])
+                self.color.par_chunks_mut(w * 3).for_each(|r| {
+                    for p in r.chunks_exact_mut(3) {
+                        p.copy_from_slice(&px);
+                    }
+                });
+                self.alpha.par_chunks_mut(w).for_each(|r| r.fill(1.0));
             }
-            None => (vec![0.0; n * 3], vec![0.0; n]),
-        };
-        Canvas { width, height, color, alpha }
+            None => {
+                self.color.par_chunks_mut(w * 3).for_each(|r| r.fill(0.0));
+                self.alpha.par_chunks_mut(w).for_each(|r| r.fill(0.0));
+            }
+        }
     }
 
     pub fn draw(&mut self, px: &Pixels, rect: Rect, blend: Blend, opacity: f32) {
@@ -222,6 +269,36 @@ mod tests {
         assert_eq!(run(Blend::Add), 255);
         assert_eq!(run(Blend::Multiply), (100.0f32 * 200.0 / 255.0 + 0.5) as u8);
         assert_eq!(run(Blend::Screen), (255.0 - 155.0f32 * 55.0 / 255.0 + 0.5) as u8);
+    }
+
+    #[test]
+    fn cleared_canvas_matches_a_new_one() {
+        let layer = Image::filled(2, 2, &[200, 100, 50, 64]);
+        for bg in [Some([10, 20, 30]), None] {
+            let mut cv = Canvas::new(3, 2, Some([255, 255, 255]));
+            cv.draw(&Pixels::rgba(&layer), rect(1, 0, 2, 2), Blend::Screen, 0.5);
+            cv.clear(bg);
+            cv.draw(&Pixels::rgba(&layer), rect(0, 0, 2, 2), Blend::Normal, 1.0);
+            let mut fresh = Canvas::new(3, 2, bg);
+            fresh.draw(&Pixels::rgba(&layer), rect(0, 0, 2, 2), Blend::Normal, 1.0);
+            assert_eq!(cv.image(bg.is_none()), fresh.image(bg.is_none()));
+        }
+    }
+
+    #[test]
+    fn opaque_layer_over_the_whole_canvas_needs_no_canvas() {
+        let rgb = Image::new(3, 2, 3, (0..18).map(|v| v * 14).collect()).unwrap();
+        let rgba = rgb.to_rgba();
+        for img in [&rgb, &rgba] {
+            let px = Pixels::rgba(img);
+            assert!(px.is_opaque());
+            for transparent in [false, true] {
+                let mut cv = Canvas::new(3, 2, if transparent { None } else { Some([9, 9, 9]) });
+                cv.draw(&px, rect(0, 0, 3, 2), Blend::Normal, 1.0);
+                assert_eq!(px.opaque_image(transparent), cv.image(transparent));
+            }
+        }
+        assert!(!Pixels::rgba(&Image::filled(1, 1, &[1, 2, 3, 254])).is_opaque());
     }
 
     #[test]

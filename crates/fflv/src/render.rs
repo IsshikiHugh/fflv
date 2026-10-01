@@ -67,45 +67,64 @@ pub fn format_pattern(pattern: &str, index: u32) -> Result<String> {
 }
 
 pub trait Sink {
-    fn write(&mut self, index: u32, img: &Image) -> Result<()>;
+    fn write(&mut self, index: u32, img: Image) -> Result<()>;
     fn close(self: Box<Self>) -> Result<()>;
 }
 
 // ------------------------------------------------------------------------------------------------
 // PNG files (encoded on worker threads, overlapping with decoding)
 // ------------------------------------------------------------------------------------------------
+fn write_png(path: &Path, img: &Image) -> Result<()> {
+    ensure_parent(path)?;
+    fs::write(path, encode_png(img.view(), true)?)?;
+    Ok(())
+}
+
 struct PngSink {
     pattern: Option<String>,
     single: Option<PathBuf>,
     count: u32,
     tx: Option<SyncSender<(PathBuf, Image)>>,
-    workers: Vec<JoinHandle<Result<()>>>,
+    workers: Vec<JoinHandle<()>>,
+    /// The first error of any worker; the next write() or close() returns it.
+    failed: Arc<Mutex<Option<Error>>>,
 }
 
 impl PngSink {
     fn new(pattern: Option<String>, single: Option<PathBuf>) -> PngSink {
         let (tx, rx): (SyncSender<(PathBuf, Image)>, Receiver<(PathBuf, Image)>) = sync_channel(8);
         let rx = Arc::new(Mutex::new(rx));
+        let failed: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
         let n = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 6);
         let workers = (0..n)
             .map(|_| {
-                let rx = rx.clone();
-                std::thread::spawn(move || -> Result<()> {
-                    loop {
-                        let job = rx.lock().unwrap().recv();
-                        let Ok((path, img)) = job else { return Ok(()) };
-                        ensure_parent(&path)?;
-                        fs::write(&path, encode_png(img.view(), true)?)?;
+                let (rx, failed) = (rx.clone(), failed.clone());
+                std::thread::spawn(move || loop {
+                    let job = rx.lock().unwrap().recv();
+                    let Ok((path, img)) = job else { return };
+                    if let Err(e) = write_png(&path, &img) {
+                        let mut slot = failed.lock().unwrap_or_else(|e| e.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        return;
                     }
                 })
             })
             .collect();
-        PngSink { pattern, single, count: 0, tx: Some(tx), workers }
+        PngSink { pattern, single, count: 0, tx: Some(tx), workers, failed }
+    }
+
+    fn take_error(&self) -> Option<Error> {
+        self.failed.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }
 
 impl Sink for PngSink {
-    fn write(&mut self, index: u32, img: &Image) -> Result<()> {
+    fn write(&mut self, index: u32, img: Image) -> Result<()> {
+        if let Some(e) = self.take_error() {
+            return Err(e);
+        }
         let path = match (&self.single, &self.pattern) {
             (Some(p), _) => {
                 if self.count > 0 {
@@ -120,23 +139,24 @@ impl Sink for PngSink {
             (None, None) => unreachable!(),
         };
         self.count += 1;
-        if self.tx.as_ref().unwrap().send((path, img.clone())).is_err() {
-            // a worker failed; its error is reported by close()
-            return Ok(());
+        if self.tx.as_ref().unwrap().send((path, img)).is_err() {
+            // every worker has stopped
+            return Err(self.take_error().unwrap_or_else(|| Error::Output("PNG writer threads stopped".into())));
         }
         Ok(())
     }
 
     fn close(mut self: Box<Self>) -> Result<()> {
         drop(self.tx.take());
-        let mut first = Ok(());
+        let mut panicked = false;
         for w in self.workers.drain(..) {
-            let r = w.join().unwrap_or_else(|_| out_err("PNG writer thread panicked"));
-            if first.is_ok() {
-                first = r;
-            }
+            panicked |= w.join().is_err();
         }
-        first
+        match self.take_error() {
+            Some(e) => Err(e),
+            None if panicked => out_err("PNG writer thread panicked"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -260,15 +280,15 @@ fn pad_even(img: &Image) -> Option<Image> {
 }
 
 impl Sink for FfmpegSink {
-    fn write(&mut self, index: u32, img: &Image) -> Result<()> {
+    fn write(&mut self, index: u32, img: Image) -> Result<()> {
         if self.single && self.count > 0 {
             return out_err(format!(
                 "{} holds one frame; use a pattern like frames/%05d.png or a directory",
                 self.output.display()
             ));
         }
-        let padded = if self.kind.even() { pad_even(img) } else { None };
-        let img = padded.as_ref().unwrap_or(img);
+        let padded = if self.kind.even() { pad_even(&img) } else { None };
+        let img = padded.as_ref().unwrap_or(&img);
         if self.child.is_none() {
             self.start(index, img.width, img.height, img.channels)?;
         } else if self.size != (img.width, img.height) {
@@ -323,7 +343,7 @@ fn npy_header(shape: &str, len: usize) -> Vec<u8> {
 const NPY_HEADER_LEN: usize = 128;
 
 impl Sink for NpySink {
-    fn write(&mut self, _index: u32, img: &Image) -> Result<()> {
+    fn write(&mut self, _index: u32, img: Image) -> Result<()> {
         if self.out.is_none() {
             ensure_parent(&self.path)?;
             self.shape = (img.width, img.height, img.channels);
@@ -461,7 +481,7 @@ fn drain(
     let mut n = 0;
     let mut result = Ok(());
     for item in frames {
-        match item.and_then(|(f, img)| sink.write(f, &img)) {
+        match item.and_then(|(f, img)| sink.write(f, img)) {
             Ok(()) => {
                 n += 1;
                 if let Some(Err(e)) = progress.as_mut().map(|p| p(n, total)) {

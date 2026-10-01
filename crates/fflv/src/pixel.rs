@@ -1,8 +1,9 @@
 //! Conversions between interleaved 8-bit images and the planar pictures of the VP9 streams.
 //!
-//! Encoding side: RGB → BT.709 limited-range 4:2:0 (chroma = mean of each 2×2 block), RGB → G/B/R
-//! planes (lossless), alpha → luma. Odd images are padded to the even coded size by repeating the
-//! last column / row (cropped away again on playback, spec B.4).
+//! Encoding side: RGB → BT.709 limited-range 4:2:0 (chroma = mean of each 2×2 block, weighted by
+//! alpha when there is alpha), RGB → G/B/R planes (lossless), alpha → luma. Odd images are padded
+//! to the even coded size by repeating the last column / row (cropped away again on playback,
+//! spec B.4).
 //!
 //! Decoding side: the exact matrix formula (BT.601 / 709 / 2020, limited or full range, as the
 //! stream says) with nearest-neighbour chroma, and luma → alpha. Done here rather than by a
@@ -51,51 +52,120 @@ pub fn alpha_to_limited(a: u8) -> u8 {
     ((a as u32 * 219 + 127) / 255 + 16) as u8
 }
 
+/// One pixel of a `C`-channel image as RGBA (gray → R = G = B, missing alpha → 255).
+#[inline(always)]
+fn rgba<const C: usize>(p: &[u8]) -> [u8; 4] {
+    match C {
+        1 => [p[0], p[0], p[0], 255],
+        3 => [p[0], p[1], p[2], 255],
+        _ => [p[0], p[1], p[2], p[3]],
+    }
+}
+
+/// Luma of a 2×2 block `p` (top-left, top-right, bottom-left, bottom-right) into `ya` / `yb`,
+/// and its chroma. `weighted`: the chroma is the alpha-weighted mean of the four colors, so fully
+/// transparent pixels (whose color is arbitrary) do not bleed into the visible edge of a layer;
+/// when the four alphas are equal (opaque images) this is exactly the plain mean.
+#[inline(always)]
+fn block(p: &[[u8; 4]; 4], ya: &mut [u8], yb: &mut [u8], u: &mut u8, v: &mut u8, weighted: bool) {
+    let (mut sr, mut sg, mut sb) = (0, 0, 0);
+    let (mut wr, mut wg, mut wb, mut sa) = (0, 0, 0, 0);
+    for (k, q) in p.iter().enumerate() {
+        let (r, g, b) = (q[0] as i32, q[1] as i32, q[2] as i32);
+        let y = luma(r, g, b);
+        if k < 2 {
+            ya[k] = y;
+        } else {
+            yb[k - 2] = y;
+        }
+        sr += r;
+        sg += g;
+        sb += b;
+        if weighted {
+            let a = q[3] as i32;
+            wr += r * a;
+            wg += g * a;
+            wb += b * a;
+            sa += a;
+        }
+    }
+    if weighted && sa > 0 {
+        // the weighted mean, scaled like a sum of 4 samples and rounded
+        (sr, sg, sb) = ((4 * wr + sa / 2) / sa, (4 * wg + sa / 2) / sa, (4 * wb + sa / 2) / sa);
+    }
+    *u = chroma4(CB_R, CB_G, CB_B, sr, sg, sb);
+    *v = chroma4(CR_R, CR_G, CR_B, sr, sg, sb);
+}
+
+/// One row pair of [`color_i420`]: `r0` / `r1` hold `w` pixels of `C` channels each; `y0` / `y1`
+/// / `u` / `v` are the output rows (2·`u.len()` luma samples each).
+fn i420_rows<const C: usize>(r0: &[u8], r1: &[u8], w: usize, y0: &mut [u8], y1: &mut [u8], u: &mut [u8], v: &mut [u8]) {
+    let half = u.len();
+    let pairs = (w / 2).min(half);
+    let src = r0.chunks_exact(2 * C).zip(r1.chunks_exact(2 * C));
+    let dst = y0.chunks_exact_mut(2).zip(y1.chunks_exact_mut(2)).zip(u.iter_mut().zip(v.iter_mut()));
+    for ((a, b), ((ya, yb), (cu, cv))) in src.zip(dst).take(pairs) {
+        let p = [rgba::<C>(&a[..C]), rgba::<C>(&a[C..]), rgba::<C>(&b[..C]), rgba::<C>(&b[C..])];
+        block(&p, ya, yb, cu, cv, C == 4);
+    }
+    // an odd last column and the padding repeat the last pixel
+    for i in pairs..half {
+        let (x0, x1) = ((2 * i).min(w - 1) * C, (2 * i + 1).min(w - 1) * C);
+        let p = [rgba::<C>(&r0[x0..]), rgba::<C>(&r0[x1..]), rgba::<C>(&r1[x0..]), rgba::<C>(&r1[x1..])];
+        block(&p, &mut y0[2 * i..2 * i + 2], &mut y1[2 * i..2 * i + 2], &mut u[i], &mut v[i], C == 4);
+    }
+}
+
 /// BT.709 limited-range 4:2:0 picture of size `cw`×`ch` (even) from `src` (padded by repetition).
+/// With alpha, chroma is alpha-weighted (see [`block`]).
 pub fn color_i420(src: ImageRef, cw: u32, ch: u32) -> Planar {
     debug_assert!(cw % 2 == 0 && ch % 2 == 0 && cw >= src.width && ch >= src.height);
     let mut out = Planar::new(PlaneFormat::I420, cw, ch);
-    let (w, h) = (src.width, src.height);
+    let w = src.width as usize;
     let (cwu, half) = (cw as usize, (cw / 2) as usize);
     let (yp, up, vp) = out.planes_mut();
     yp.par_chunks_mut(2 * cwu).zip(up.par_chunks_mut(half)).zip(vp.par_chunks_mut(half)).enumerate().for_each(
         |(j, ((yrows, urow), vrow))| {
-            let rows = [(2 * j as u32).min(h - 1), (2 * j as u32 + 1).min(h - 1)];
-            for i in 0..half {
-                let (mut sr, mut sg, mut sb) = (0, 0, 0);
-                for (dy, &sy) in rows.iter().enumerate() {
-                    for dx in 0..2 {
-                        let x = 2 * i + dx;
-                        let p = src.rgba_at((x as u32).min(w - 1), sy);
-                        let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
-                        yrows[dy * cwu + x] = luma(r, g, b);
-                        sr += r;
-                        sg += g;
-                        sb += b;
-                    }
-                }
-                urow[i] = chroma4(CB_R, CB_G, CB_B, sr, sg, sb);
-                vrow[i] = chroma4(CR_R, CR_G, CR_B, sr, sg, sb);
+            let (r0, r1) = (src.row(2 * j as u32), src.row(2 * j as u32 + 1));
+            let (y0, y1) = yrows.split_at_mut(cwu);
+            match src.channels {
+                1 => i420_rows::<1>(r0, r1, w, y0, y1, urow, vrow),
+                3 => i420_rows::<3>(r0, r1, w, y0, y1, urow, vrow),
+                _ => i420_rows::<4>(r0, r1, w, y0, y1, urow, vrow),
             }
         },
     );
     out
 }
 
+/// One row of [`color_gbr`]: `src` holds the pixels (`C` channels), the planes are padded by
+/// repeating the last one.
+fn gbr_row<const C: usize>(src: &[u8], g: &mut [u8], b: &mut [u8], r: &mut [u8]) {
+    let w = src.len() / C;
+    for (((p, g), b), r) in src.chunks_exact(C).zip(g.iter_mut()).zip(b.iter_mut()).zip(r.iter_mut()) {
+        let p = rgba::<C>(p);
+        (*r, *g, *b) = (p[0], p[1], p[2]);
+    }
+    if g.len() > w {
+        let p = rgba::<C>(&src[(w - 1) * C..]);
+        r[w..].fill(p[0]);
+        g[w..].fill(p[1]);
+        b[w..].fill(p[2]);
+    }
+}
+
 /// Lossless RGB picture (4:4:4, planes G, B, R as VP9 stores RGB) of size `cw`×`ch`.
 pub fn color_gbr(src: ImageRef, cw: u32, ch: u32) -> Planar {
     let mut out = Planar::new(PlaneFormat::I444, cw, ch);
-    let (w, h) = (src.width, src.height);
     let cwu = cw as usize;
     let (gp, bp, rp) = out.planes_mut();
     gp.par_chunks_mut(cwu).zip(bp.par_chunks_mut(cwu)).zip(rp.par_chunks_mut(cwu)).enumerate().for_each(
         |(y, ((g, b), r))| {
-            let sy = (y as u32).min(h - 1);
-            for x in 0..cwu {
-                let p = src.rgba_at((x as u32).min(w - 1), sy);
-                r[x] = p[0];
-                g[x] = p[1];
-                b[x] = p[2];
+            let row = src.row(y as u32);
+            match src.channels {
+                1 => gbr_row::<1>(row, g, b, r),
+                3 => gbr_row::<3>(row, g, b, r),
+                _ => gbr_row::<4>(row, g, b, r),
             }
         },
     );
@@ -106,16 +176,23 @@ pub fn color_gbr(src: ImageRef, cw: u32, ch: u32) -> Planar {
 /// layers) or limited range (Y = 16..235). Images without an alpha channel are opaque.
 pub fn alpha_i420(src: ImageRef, cw: u32, ch: u32, full: bool) -> Planar {
     let mut out = Planar::new(PlaneFormat::I420, cw, ch);
-    let (w, h) = (src.width, src.height);
+    let w = src.width as usize;
     let cwu = cw as usize;
+    let lut: [u8; 256] = std::array::from_fn(|a| if full { a as u8 } else { alpha_to_limited(a as u8) });
     let (yp, up, vp) = out.planes_mut();
     up.fill(128);
     vp.fill(128);
+    if src.channels != 4 {
+        yp.fill(lut[255]);
+        return out;
+    }
     yp.par_chunks_mut(cwu).enumerate().for_each(|(y, row)| {
-        let sy = (y as u32).min(h - 1);
-        for (x, v) in row.iter_mut().enumerate() {
-            let a = src.rgba_at((x as u32).min(w - 1), sy)[3];
-            *v = if full { a } else { alpha_to_limited(a) };
+        for (v, p) in row.iter_mut().zip(src.row(y as u32).chunks_exact(4)) {
+            *v = lut[p[3] as usize];
+        }
+        if row.len() > w {
+            let last = row[w - 1];
+            row[w..].fill(last);
         }
     });
     out
@@ -222,6 +299,7 @@ pub fn frame_to_alpha(f: &Frame, w: u32, h: u32, full: bool, out: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image::Image;
 
     #[test]
     fn limited_range_extremes() {
@@ -246,6 +324,24 @@ mod tests {
         }
         assert_eq!(t[0], 16);
         assert_eq!(t[255], 235);
+    }
+
+    #[test]
+    fn chroma_is_alpha_weighted() {
+        // one opaque red pixel among transparent black ones keeps the chroma of red
+        let mut data = vec![0u8; 16];
+        data[..4].copy_from_slice(&[255, 0, 0, 255]);
+        let edge = color_i420(ImageRef::new(2, 2, 4, &data).unwrap(), 2, 2);
+        let red = Image::filled(2, 2, &[255, 0, 0, 255]);
+        let solid = color_i420(red.view(), 2, 2);
+        assert_eq!(&edge.planes()[1..], &solid.planes()[1..]);
+        // equal alphas: the plain mean, as without alpha
+        let rgba: Vec<u8> =
+            [10u8, 200, 30, 90, 250, 0, 60, 120].iter().flat_map(|&v| [v, 255 - v, v / 2, 77]).collect();
+        let rgb: Vec<u8> = rgba.chunks(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let a = color_i420(ImageRef::new(4, 2, 4, &rgba).unwrap(), 4, 2);
+        let b = color_i420(ImageRef::new(4, 2, 3, &rgb).unwrap(), 4, 2);
+        assert_eq!(a, b);
     }
 
     #[test]

@@ -191,11 +191,30 @@ fn default_threads() -> u32 {
     std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(2).min(8)
 }
 
+/// Largest time base term libvpx accepts.
+const TIMEBASE_MAX: u64 = 1_000_000_000;
+
+/// libvpx time base (seconds per tick) for `fps`: 1/fps, with both terms at most 10^9. A rate
+/// whose terms are larger (e.g. 23.976023976 = 2997002997/125000000) is approximated by halving
+/// both terms: the pts advance by one tick per frame, so the time base only informs rate control.
+/// None when that is off by more than 1e-6 (absurd rates such as 4294967295/1).
+fn timebase(fps: Fps) -> Option<vpx::vpx_rational> {
+    let (mut num, mut den) = (fps.den as u64, fps.num as u64);
+    while num > TIMEBASE_MAX || den > TIMEBASE_MAX {
+        num = num.div_ceil(2);
+        den = den.div_ceil(2);
+    }
+    let error = (num as f64 / den as f64) / (fps.den as f64 / fps.num as f64) - 1.0;
+    (error.abs() <= 1e-6).then_some(vpx::vpx_rational { num: num as c_int, den: den as c_int })
+}
+
 // ------------------------------------------------------------------------------------------------
 // Encoder
 // ------------------------------------------------------------------------------------------------
 pub struct Encoder {
     ctx: Box<vpx::vpx_codec_ctx_t>,
+    /// the configuration the context runs with (for [`Encoder::set_threads`])
+    cfg: Box<vpx::vpx_codec_enc_cfg_t>,
     width: u32,
     height: u32,
     format: PlaneFormat,
@@ -249,7 +268,8 @@ impl Encoder {
             cfg.g_w = width;
             cfg.g_h = height;
             cfg.g_profile = if format == PlaneFormat::I444 { 1 } else { 0 };
-            cfg.g_timebase = vpx::vpx_rational { num: fps.den as c_int, den: fps.num as c_int };
+            cfg.g_timebase = timebase(fps)
+                .ok_or_else(|| fail(format!("frame rate {}/{} is out of libvpx's range", fps.num, fps.den)))?;
             cfg.g_threads = if opts.threads > 0 { opts.threads } else { default_threads() };
             cfg.g_pass = vpx::VPX_RC_ONE_PASS;
             cfg.g_lag_in_frames = 0;
@@ -258,12 +278,13 @@ impl Encoder {
             cfg.kf_mode = vpx::VPX_KF_AUTO;
             cfg.kf_min_dist = NEVER;
             cfg.kf_max_dist = NEVER;
+            let cfg = Box::new(cfg);
             let mut ctx: Box<vpx::vpx_codec_ctx_t> = Box::new(std::mem::zeroed());
-            let rc = vpx::fflv_vp9_enc_init(&mut *ctx, &cfg, 0);
+            let rc = vpx::fflv_vp9_enc_init(&mut *ctx, &*cfg, 0);
             if rc != vpx::VPX_CODEC_OK {
                 return Err(fail(format!("cannot start libvpx: {}", codec_message(&*ctx, rc))));
             }
-            let mut enc = Encoder { ctx, width, height, format, signal, deadline, pts: 0, what: what.into() };
+            let mut enc = Encoder { ctx, cfg, width, height, format, signal, deadline, pts: 0, what: what.into() };
             let (cs, range) = signal.vpx();
             let mut controls = vec![
                 (vpx::VP8E_SET_CPUUSED, cpu_used),
@@ -289,6 +310,31 @@ impl Encoder {
 
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Change the number of libvpx threads before the first frame (e.g. once the number of
+    /// streams encoded in parallel is known).
+    pub fn set_threads(&mut self, threads: u32) -> Result<()> {
+        let threads = threads.max(1);
+        if self.cfg.g_threads == threads {
+            return Ok(());
+        }
+        if self.pts != 0 {
+            return Err(Error::Encode(format!("{}: threads can only change before the first frame", self.what)));
+        }
+        let old = self.cfg.g_threads;
+        self.cfg.g_threads = threads;
+        // SAFETY: the context was initialised in new(); libvpx copies the configuration.
+        let rc = unsafe { vpx::vpx_codec_enc_config_set(&mut *self.ctx, &*self.cfg) };
+        if rc != vpx::VPX_CODEC_OK {
+            self.cfg.g_threads = old;
+            return Err(Error::Encode(format!(
+                "{}: cannot use {threads} threads: {}",
+                self.what,
+                codec_message(&*self.ctx, rc)
+            )));
+        }
+        Ok(())
     }
 
     /// Encode one picture; returns its packet.
@@ -526,5 +572,25 @@ impl Drop for Decoder {
         unsafe {
             vpx::vpx_codec_destroy(&mut *self.ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timebase_fits_libvpx_limits() {
+        let tb = timebase(Fps::new(30000, 1001).unwrap()).unwrap();
+        assert_eq!((tb.num, tb.den), (1001, 30000));
+        let fps = Fps::new(23_976_023_976, 1_000_000_000).unwrap();
+        assert!(fps.num as u64 > TIMEBASE_MAX);
+        let tb = timebase(fps).unwrap();
+        assert!(tb.num > 0 && tb.den > 0 && tb.den as u64 <= TIMEBASE_MAX);
+        let exact = fps.den as f64 / fps.num as f64;
+        assert!((tb.num as f64 / tb.den as f64 / exact - 1.0).abs() < 1e-8);
+        let tb = timebase(Fps { num: u32::MAX, den: u32::MAX - 2 }).unwrap();
+        assert!(tb.num as u64 <= TIMEBASE_MAX && tb.den as u64 <= TIMEBASE_MAX);
+        assert!(timebase(Fps { num: u32::MAX, den: 1 }).is_none());
     }
 }
