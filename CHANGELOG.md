@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-10-01)
 
 - The built web player is no longer tracked: building fflv (`cargo build`, `maturin develop`,
   `pip install .`) builds it from `player/` when its sources change, so it never goes stale and
@@ -24,6 +24,17 @@
   of the file's).
 - Player: the layer order can be changed by dragging rows (or Move up / down in a row's details);
   it is kept when the file reloads, and "reset order" restores the file's z order.
+- Robustness: malformed files can no longer stall or overflow the reader or validator; edits lock
+  the source until the result is published (unlocked where the file system cannot lock), keep its
+  permissions and follow symbolic links; `rm FILE --audio -o OUT` reads FILE (it edited OUT);
+  `fflv view` bounds request bodies and writes exports to a private directory.
+- Player: no silence after a backward seek or loop, no stuck end, sound keeps playing in a hidden
+  tab, overlapping loads and WebGL context loss are handled; fewer requests and allocations.
+- Faster: the compositing canvas is reused, encoder and decoder threads are shared, and
+  `Reader.frame(i)` reuses its decoder for sequential access.
+- Behaviour changes: Rust ≥ 1.89 to build; canvas sides are limited to 16384; chroma of lossy
+  alpha layers is alpha-weighted (transparent pixels no longer bleed into edges); cancelling an
+  export needs a JSON request.
 
 ## 0.3.0 (2026-09-27)
 
