@@ -4,9 +4,10 @@
 
 - The built web player is no longer tracked: building fflv (`cargo build`, `maturin develop`,
   `pip install .`) builds it from `player/` when its sources change, so it never goes stale and
-  pull requests no longer carry a bundle. This needs Node.js ≥ 20 with npm; without it fflv builds
-  without the player and `fflv view` says so (`FFLV_PLAYER=skip` does that on purpose). Release
-  builds build it once; the wheels, binaries and sdist include it, so installing needs no Node.
+  pull requests no longer carry a bundle. This needs Node.js with npm (version in the README);
+  without it, or when the player fails to build, fflv builds without the player (with a warning)
+  and `fflv view` says so (`FFLV_PLAYER=skip` does that on purpose). Release builds build it
+  once; the wheels, binaries and sdist include it, so installing needs no Node.
 - `fflv view` (and `fflv.view`) no longer opens a browser by default: it prints the URL. `--open`
   (`open_page=True`) or `--browser` opens it as before; `--no-open` is still accepted.
 - `scripts/install.sh`: installs the latest (or a chosen) release into the active Python
