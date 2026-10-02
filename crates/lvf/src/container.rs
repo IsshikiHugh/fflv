@@ -481,8 +481,16 @@ fn rewrite(
 /// when the file is closed). The in-place metadata edits hold it for their whole read, choose slot,
 /// write, switch sequence; a writer that replaces an LVF file (rewrite + rename over it) can hold
 /// it on the source file to serialize with them. Plain readers do not lock.
+///
+/// Where the file system cannot lock, this returns without the lock and the edit runs
+/// unserialized, as it did before edits locked, rather than not at all: e.g. NFS without a lock
+/// daemon (ENOLCK), NFSv4 refusing an exclusive lock on a file opened read-only (EBADF), or no
+/// lock support. Only an interrupted wait (a signal, e.g. Ctrl+C) is an error.
 pub fn lock_exclusive(file: &File) -> Result<()> {
-    Ok(file.lock()?)
+    match file.lock() {
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 /// Open `path` for reading and writing with [`lock_exclusive`] held. If the file was replaced

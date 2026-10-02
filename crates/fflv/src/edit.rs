@@ -88,7 +88,8 @@ fn interrupt_check() -> Result<()> {
 /// Open `path` and take an exclusive lock on it (waiting for other edits of it to finish). When
 /// the file was replaced (renamed over) while waiting, the new one is locked instead. Unix only:
 /// Windows locks are mandatory, so there the lock would also stop the edit's own reader (and the
-/// viewer) from reading the file; elsewhere edits run unlocked.
+/// viewer) from reading the file; elsewhere edits run unlocked. Where the file system cannot lock
+/// (see [`lvf::container::lock_exclusive`]) the edit runs unlocked too.
 fn lock_file(path: &Path) -> Result<File> {
     // (read-only, unlike lvf::container::open_locked: the source of an edit written elsewhere
     // need not be writable)
@@ -97,11 +98,7 @@ fn lock_file(path: &Path) -> Result<File> {
         if cfg!(not(unix)) {
             return Ok(f);
         }
-        match f.lock() {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => return Ok(f),
-            Err(e) => return Err(e.into()),
-        }
+        lvf::container::lock_exclusive(&f)?;
         if is_file_at(&f, path) {
             return Ok(f);
         }

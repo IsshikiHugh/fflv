@@ -85,9 +85,9 @@ ssh -L 8765:127.0.0.1:8765 user@server               # on your machine, then ope
 #### From source
 
 Needs Rust ≥ 1.89, libvpx and pkg-config (`brew install libvpx pkg-config` on macOS;
-`apt install libvpx-dev pkg-config libclang-dev` on Debian/Ubuntu), and Node.js ≥ 20 with npm for
-the web player, which is built into fflv as it compiles (without npm, fflv builds without it and
-`fflv view` reports that):
+`apt install libvpx-dev pkg-config libclang-dev` on Debian/Ubuntu), and Node.js ≥ 20.19 with npm
+for the web player, which is built into fflv as it compiles (without npm, or when the player fails
+to build, fflv builds without it with a warning and `fflv view` reports that):
 
 ```bash
 cargo install --path crates/fflv   # the fflv command
@@ -134,7 +134,7 @@ from this README when it is missing. Link it into your skills:
 ## Development
 
 Prerequisites: the build dependencies above, FFmpeg (the test material is generated with it),
-Node ≥ 20 for the player, and Python ≥ 3.9 for the package.
+Node.js for the player (version above), and Python ≥ 3.9 for the package.
 
 ```bash
 cargo test --release                                     # Rust
@@ -151,7 +151,7 @@ Building fflv builds the player from `player/` (`crates/fflv/build.rs`, whenever
 change), so after editing the player, `cargo build` or `maturin develop` is all it takes; the built
 player is not tracked. `FFLV_PLAYER` changes that: `skip` builds fflv without the player, `prebuilt`
 takes it from `crates/fflv/viewer` (what `npm run build` writes; release builds build it once this
-way), and `build` fails when npm is missing (CI). All of the above runs in CI
+way), and `build` fails when npm is missing or the player does not build (CI). All of the above runs in CI
 (`.github/workflows/ci.yml`) on Linux and macOS.
 
 ## License

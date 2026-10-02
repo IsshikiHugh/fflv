@@ -106,7 +106,7 @@ impl LayerEncoder {
         let (cw, ch) = (even(self.width), even(self.height));
         let (lossless, alpha) = (self.lossless, self.alpha.is_some());
         let (color, alpha) = rayon::join(
-            || if lossless { pixel::color_gbr(img, cw, ch) } else { pixel::color_i420(img, cw, ch) },
+            || if lossless { pixel::color_gbr(img, cw, ch) } else { pixel::color_i420(img, cw, ch, alpha) },
             || alpha.then(|| pixel::alpha_i420(img, cw, ch, lossless)),
         );
         Ok(Prepared { color, alpha })

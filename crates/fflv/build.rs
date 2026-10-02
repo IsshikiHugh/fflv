@@ -3,10 +3,12 @@
 //!
 //! - unset or `auto`: in a checkout (player/ present) with npm on PATH, build the player whenever
 //!   its sources change (`npm ci` first when player/node_modules is missing or older than
-//!   package-lock.json). Without npm, use crates/fflv/viewer when it holds a build (a source
-//!   package ships one; `npm run build` in player/ writes one); otherwise build fflv without the
-//!   player (`fflv view` then says so).
-//! - `build`: like `auto`, but npm is required (CI: never build without the player by accident).
+//!   package-lock.json). Without npm, or when that build fails (a warning: e.g. a Node.js too old
+//!   for vite, or `npm ci` offline), use crates/fflv/viewer when it holds a build (a source package
+//!   ships one; `npm run build` in player/ writes one); otherwise build fflv without the player
+//!   (`fflv view` then says so).
+//! - `build`: like `auto`, but npm and a successful build are required (CI: never build without
+//!   the player by accident).
 //! - `prebuilt`: use crates/fflv/viewer as it is; it must hold a build (release builds, which
 //!   build the player once and pass it to every platform).
 //! - `skip`: build without the player.
@@ -26,10 +28,7 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("viewer");
     let player = manifest.join("../../player");
     let prebuilt = manifest.join("viewer");
-    let cleared =
-        fs::remove_dir_all(&out).or_else(|e| if e.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(e) });
-    cleared.unwrap_or_else(|e| panic!("cannot clear {}: {e}", out.display()));
-    fs::create_dir_all(&out).unwrap_or_else(|e| panic!("cannot create {}: {e}", out.display()));
+    clear(&out);
 
     let mode = env::var("FFLV_PLAYER").unwrap_or_default();
     let result = match mode.as_str() {
@@ -46,34 +45,48 @@ fn main() {
 
 fn auto(player: &Path, prebuilt: &Path, out: &Path, required: bool) -> Result<(), String> {
     let checkout = player.join("package.json").is_file();
+    // why the player is not built from its sources (None: no checkout)
+    let mut reason = None;
     if checkout {
         for s in SOURCES {
             println!("cargo:rerun-if-changed={}", player.join(s).display());
         }
-        if let Some(npm) = find_npm() {
-            return build(&npm, player, out);
-        }
-        if required {
-            return Err("FFLV_PLAYER=build: npm was not found (install Node.js ≥ 20)".into());
-        }
-        // let installing Node take effect without touching the player's sources
+        reason = Some(match find_npm() {
+            Some(npm) => match build(&npm, player, out) {
+                Ok(()) => return Ok(()),
+                Err(e) if required => {
+                    return Err(format!("{e} (output above); FFLV_PLAYER=skip builds fflv without the player"));
+                }
+                // e.g. a Node.js too old for vite, or npm ci offline: fall back as without npm
+                Err(e) => {
+                    clear(out);
+                    e
+                }
+            },
+            None if required => return Err("FFLV_PLAYER=build: npm was not found (install Node.js)".into()),
+            None => "npm was not found".to_string(),
+        });
+        // let installing or upgrading Node take effect without touching the player's sources
         println!("cargo:rerun-if-env-changed=PATH");
     } else if required {
         return Err(format!("FFLV_PLAYER=build: no player sources at {}", player.display()));
     }
     if prebuilt.join("index.html").is_file() {
-        if checkout {
-            warn("npm was not found: the web player is taken from crates/fflv/viewer, which may be older than player/src");
+        if let Some(reason) = &reason {
+            warn(&format!(
+                "{reason}: the web player is taken from crates/fflv/viewer, which may be older than player/src"
+            ));
         }
         return use_prebuilt(prebuilt, out);
     }
-    if checkout {
-        warn(
-            "npm was not found: fflv is built without the web player (`fflv view` will not work). Install Node.js \
-             ≥ 20 and build again, or set FFLV_PLAYER=skip to silence this.",
-        );
-    } else {
-        warn("no built player in crates/fflv/viewer: fflv is built without the web player (`fflv view` will not work)");
+    match &reason {
+        Some(reason) => warn(&format!(
+            "{reason}: fflv is built without the web player (`fflv view` will not work). Install Node.js (see \
+             README) and build again, or set FFLV_PLAYER=skip to silence this."
+        )),
+        None => warn(
+            "no built player in crates/fflv/viewer: fflv is built without the web player (`fflv view` will not work)",
+        ),
     }
     Ok(())
 }
@@ -99,10 +112,16 @@ fn run(cmd: &mut Command, what: &str) -> Result<(), String> {
     if status.success() {
         Ok(())
     } else {
-        Err(format!(
-            "{what} failed in player/ ({status}, output above); FFLV_PLAYER=skip builds fflv without the player"
-        ))
+        Err(format!("{what} failed in player/ ({status})"))
     }
+}
+
+/// Make `out` an empty directory.
+fn clear(out: &Path) {
+    let cleared =
+        fs::remove_dir_all(out).or_else(|e| if e.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(e) });
+    cleared.unwrap_or_else(|e| panic!("cannot clear {}: {e}", out.display()));
+    fs::create_dir_all(out).unwrap_or_else(|e| panic!("cannot create {}: {e}", out.display()));
 }
 
 fn find_npm() -> Option<String> {
