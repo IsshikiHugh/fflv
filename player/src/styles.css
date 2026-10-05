@@ -38,11 +38,27 @@ button { font: inherit; color: inherit; }
 .btn:disabled { opacity: 0.5; cursor: default; filter: none; }
 
 /* Export (only with `fflv view`): format, button, progress / result. */
-.export { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.export-status { color: var(--dim); font-family: var(--mono); font-size: 12px; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#btn-export { min-width: 124px; }
+.export { position: relative; display: flex; align-items: center; gap: 8px; min-width: 0; }
+.export-status { color: var(--dim); font-family: var(--mono); font-size: 12px; max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .export-status.bad { color: var(--danger); }
-.export-format { background: var(--panel-3); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 6px; font: inherit; font-size: 13px; }
+.export-download { color: var(--accent); font-size: 12px; }
+#btn-export { min-width: 124px; }
+.export-format, .export-num, .export-path { background: var(--panel-3); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 7px; font: inherit; font-size: 13px; }
+.export-num, .export-path { font-family: var(--mono); }
+.export-num { width: 7ch; text-align: right; }
+.export-num:invalid, .export-num.bad { border-color: var(--danger); }
+/* The export dialog drops down from the button. */
+.export-panel { position: absolute; top: calc(100% + 10px); right: 0; z-index: 20; width: min(580px, calc(100vw - 32px)); padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); box-shadow: 0 12px 32px rgb(0 0 0 / 0.5); display: grid; gap: 10px; }
+.export-panel h3 { margin: 0; font-size: 14px; }
+.export-note { margin: 0; color: var(--dim); font-size: 12px; }
+.export-grid { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 6px 12px; }
+.export-label { color: var(--dim); font-size: 12px; }
+.export-range { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.export-info { color: var(--dim); font-size: 11px; font-family: var(--mono); }
+.export-info code { color: var(--text); }
+.export-path { width: 100%; }
+.export-error { margin: 0; color: var(--danger); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+.export-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 /* The layer panel is as wide as --side-w (dragged by the user), but always leaves the video some room. */
 .layout { --side-col: clamp(240px, var(--side-w, 300px), calc(100vw - 360px)); position: relative; flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) var(--side-col); }
@@ -80,7 +96,10 @@ body.resizing { cursor: col-resize; user-select: none; }
 .icon.play { width: 48px; }
 .icon .i-pause, .icon.playing .i-play { display: none; }
 .icon.playing .i-pause { display: block; }
-.seek { flex: 1; min-width: 160px; accent-color: var(--accent); height: 20px; margin: 0; }
+.seek-wrap { position: relative; flex: 1; min-width: 160px; display: flex; }
+.seek { flex: 1; min-width: 0; accent-color: var(--accent); height: 20px; margin: 0; }
+/* The export range under the slider's track (the thumb is 16px wide: its centre travels 8px in from each end). */
+.seek-range { position: absolute; bottom: -3px; height: 3px; left: calc(8px + (100% - 16px) * var(--from, 0)); width: max(2px, calc((100% - 16px) * (var(--to, 1) - var(--from, 0)))); background: var(--warn); border-radius: 2px; pointer-events: none; }
 .readout { display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 13px; white-space: nowrap; }
 .dim { color: var(--dim); }
 .frame-goto { padding: 2px 6px; border: 1px solid transparent; border-radius: 4px; background: none; cursor: text; font: inherit; }

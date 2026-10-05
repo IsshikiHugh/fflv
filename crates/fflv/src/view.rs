@@ -12,17 +12,23 @@
 //! before and after it; the rewrite changes the ETag (mtime), so the player's next request, sent
 //! with the old ETag in If-Match, gets 412 and the page reloads the file.
 //!
-//! The player can also export what it shows (its visible layers, at their opacities) to a video:
-//!   GET  /export              {"media", "formats"}: what this server can export
-//!   POST /export              {"format", "layers": [id...], "opacity": {id: 0–1}, "order": [id...]}
-//!                             → {"id"}; one at a time. "order" is the draw order, bottom first.
-//!   GET  /export/ID           {"state": running | done | failed | cancelled, "done", "total", "error"}
-//!   GET  /export/ID/file      the finished video, as a download named after the .lvd
+//! The player can also export what it shows (its visible layers, at their opacities, in its
+//! order) to a video file, written by this server where the user says:
+//!   GET  /export              {"media", "formats", "dir", "stem", "sep"}: what this server can
+//!                             export, and the .lvd's directory and name for a default path
+//!   POST /export              {"layers": [id...], "opacity": {id: 0–1}, "order": [id...],
+//!                             "start": N, "end": N, "path": "...", "overwrite": bool}
+//!                             → {"id", "path"}; one at a time. "order" is the draw order, bottom
+//!                             first; frames [start, end); the path's extension picks the format.
+//!   GET  /export/ID           {"state": running | done | failed | cancelled, "done", "total", "error", "path"}
+//!   GET  /export/ID/file      the finished video (also as a download)
 //!   POST /export/ID/cancel
 //! POST requests must be sent as application/json (a page on another site cannot send that
 //! without a CORS preflight, which this server does not answer). The video is rendered by
-//! [`render`] (like `fflv render`) into a private temporary directory, and kept until the next
-//! export or until the server stops (a server killed by Ctrl+C leaves it behind).
+//! [`render`] (like `fflv render`) into a hidden file next to the destination and renamed over it
+//! when complete, so the destination is never a partial video. An existing file is only replaced
+//! with "overwrite" (409 otherwise). Relative paths are relative to the .lvd's directory; on a
+//! non-loopback address, exports can only be written inside that directory.
 //!
 //! Listening on a loopback address (the default), only requests addressed to a loopback name are
 //! served (a page elsewhere must not reach the file through DNS rebinding). On another address,
@@ -134,11 +140,11 @@ pub struct ViewServer {
     bound_host: String,
     /// The current (or last) export; shared with the thread that renders it.
     export: Arc<Mutex<Option<Export>>>,
-    /// Private directory of the export files, created with the first export.
-    export_dir: Mutex<Option<PathBuf>>,
+    /// The .lvd's directory (resolved: no `..`): default place of exports, base of relative paths.
+    media_dir: PathBuf,
 }
 
-/// Export ids, unique in the process (they also name the temporary files).
+/// Export ids, unique in the process (they also name the hidden files exports are rendered into).
 static NEXT_EXPORT: AtomicU64 = AtomicU64::new(1);
 
 /// A started server (see [`ViewServer::start`]).
@@ -214,10 +220,24 @@ fn parse_range(value: &str, size: u64) -> Option<std::result::Result<(u64, u64),
     Some(Ok((start, end)))
 }
 
+/// The default port.
+const FIRST_PORT: u16 = 8765;
+/// When it is taken, the ports after it tried (then binding fails).
+const MORE_PORTS: u16 = 10;
+
+/// No other process listens on `port` on the loopback or the wildcard address. Binding 0.0.0.0
+/// succeeds even when another process holds 127.0.0.1 on that port (an ssh tunnel, say), and
+/// requests to this machine then reach that process; so an automatic port must be free on both.
+fn port_is_free(port: u16) -> bool {
+    ["127.0.0.1", "0.0.0.0"].iter().all(|h| std::net::TcpListener::bind((*h, port)).is_ok())
+}
+
 impl ViewServer {
-    /// Create (not start) the server. Port 0: the first free port from 8765.
+    /// Create (not start) the server. Port 0: 8765, or the next free one, at most [`MORE_PORTS`] on.
     pub fn bind(media: &Path, host: &str, port: u16, quiet: bool) -> Result<ViewServer> {
         let media = std::path::absolute(media)?;
+        let parent = media.parent().unwrap_or(Path::new("/"));
+        let media_dir = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
         if !media.is_file() {
             return Err(Error::View(format!("no such file: {}", media.display())));
         }
@@ -229,10 +249,20 @@ impl ViewServer {
         }
         let last_error = std::cell::RefCell::new(String::new());
         let try_bind = |p: u16| Server::http((host, p)).map_err(|e| *last_error.borrow_mut() = e.to_string()).ok();
-        let server = if port != 0 { try_bind(port) } else { (8765..8865).find_map(try_bind).or_else(|| try_bind(0)) };
+        let server = if port != 0 {
+            try_bind(port)
+        } else {
+            (FIRST_PORT..=FIRST_PORT + MORE_PORTS).filter(|&p| port_is_free(p)).find_map(try_bind)
+        };
         let server = server.ok_or_else(|| {
-            let port = if port == 0 { "any port".to_string() } else { format!("port {port}") };
-            Error::View(format!("cannot listen on {host}, {port}: {}", last_error.borrow()))
+            Error::View(if port != 0 {
+                format!("cannot listen on {host}, port {port}: {}", last_error.borrow())
+            } else {
+                format!(
+                    "cannot listen on {host}: ports {FIRST_PORT}–{} are all in use (choose another with --port)",
+                    FIRST_PORT + MORE_PORTS
+                )
+            })
         })?;
         let media_name = media.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let bound_host = host.to_ascii_lowercase();
@@ -252,7 +282,7 @@ impl ViewServer {
             loopback_only,
             bound_host,
             export: Arc::new(Mutex::new(None)),
-            export_dir: Mutex::new(None),
+            media_dir,
         })
     }
 
@@ -397,12 +427,8 @@ impl ViewServer {
 
 impl Drop for ViewServer {
     fn drop(&mut self) {
-        if let Some(e) = lock(&self.export).take() {
-            let _ = fs::remove_file(&e.path);
-        }
-        if let Some(dir) = lock(&self.export_dir).take() {
-            let _ = fs::remove_dir(&dir); // empty unless an export thread is still writing
-        }
+        // a running export sees it is gone, stops and removes its hidden file
+        lock(&self.export).take();
     }
 }
 
@@ -435,6 +461,7 @@ struct Export {
     done: u32,
     total: u32,
     cancel: bool,
+    /// Where the video goes, and the hidden file it is rendered into until it is complete.
     path: PathBuf,
     format: &'static str,
 }
@@ -447,17 +474,30 @@ impl Export {
             ExportState::Failed => "failed",
             ExportState::Cancelled => "cancelled",
         };
-        json!({"id": self.id, "state": state, "done": self.done, "total": self.total, "error": self.error})
+        json!({"id": self.id, "state": state, "done": self.done, "total": self.total, "error": self.error,
+               "path": self.path.to_string_lossy()})
     }
 }
 
-/// `{"format", "layers", "opacity", "order"}` → the output format and what to render.
-fn parse_export(body: &[u8]) -> std::result::Result<(&'static str, RenderOptions), String> {
+/// An export request (see the module docs).
+#[derive(Debug)]
+struct ExportRequest {
+    opts: RenderOptions,
+    /// As sent: absolute, relative to the .lvd's directory, or `~/...`; None: `<stem>.<format>` there.
+    path: Option<String>,
+    /// Format when no path is given (the path's extension decides otherwise).
+    format: &'static str,
+    overwrite: bool,
+}
+
+fn export_format(ext: &str) -> Option<&'static str> {
+    EXPORT_FORMATS.iter().map(|(f, _)| *f).find(|f| f.eq_ignore_ascii_case(ext))
+}
+
+fn parse_export(body: &[u8]) -> std::result::Result<ExportRequest, String> {
     let v: Value = serde_json::from_slice(body).map_err(|e| format!("not JSON: {e}"))?;
     let format = v.get("format").and_then(Value::as_str).unwrap_or("mp4");
-    let Some(&(format, _)) = EXPORT_FORMATS.iter().find(|(f, _)| *f == format) else {
-        return Err(format!("unsupported format {format:?}"));
-    };
+    let format = export_format(format).ok_or_else(|| format!("unsupported format {format:?}"))?;
     let mut opacity = Vec::new();
     if let Some(o) = v.get("opacity").filter(|o| !o.is_null()) {
         let o = o.as_object().ok_or("\"opacity\" must map layer ids to numbers")?;
@@ -476,9 +516,35 @@ fn parse_export(body: &[u8]) -> std::result::Result<(&'static str, RenderOptions
                 .ok_or_else(|| format!("\"{key}\" must be a list of layer ids")),
         }
     };
+    let frame = |key: &str| -> std::result::Result<Option<u32>, String> {
+        match v.get(key).filter(|o| !o.is_null()) {
+            None => Ok(None),
+            Some(n) => n
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .map(Some)
+                .ok_or_else(|| format!("\"{key}\" must be a frame number")),
+        }
+    };
     let layers = ids("layers")?.ok_or("\"layers\" must be a list of layer ids")?;
     let order = ids("order")?;
-    Ok((format, RenderOptions { layers: Some(layers), opacity, order, ..Default::default() }))
+    let (start, end) = (frame("start")?.unwrap_or(0), frame("end")?);
+    if end.is_some_and(|e| e <= start) {
+        return Err(format!("empty frame range {start}:{}", end.unwrap_or(0)));
+    }
+    let path = match v.get("path").filter(|p| !p.is_null()) {
+        None => None,
+        Some(p) => Some(p.as_str().filter(|p| !p.trim().is_empty()).ok_or("\"path\" must be a file path")?.to_string()),
+    };
+    let overwrite = v.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+    let opts = RenderOptions { layers: Some(layers), opacity, order, start, end, ..Default::default() };
+    Ok(ExportRequest { opts, path, format, overwrite })
+}
+
+/// The hidden file an export is rendered into, next to `dest` (same extension: it picks the format).
+fn partial_path(dest: &Path, id: u64, format: &str) -> PathBuf {
+    let name = dest.file_name().map_or("export".into(), |n| n.to_string_lossy());
+    dest.with_file_name(format!(".{name}.{}-{id}.fflv-tmp.{format}", std::process::id()))
 }
 
 /// A file name for a header: the name itself (RFC 5987) and an ASCII fallback.
@@ -505,38 +571,59 @@ fn is_json(req: &Request) -> bool {
     request_header(req, "Content-Type").is_some_and(|t| t.trim_start().starts_with("application/json"))
 }
 
-/// A new private directory (owner only, on Unix) with an unguessable name, for export files.
-fn private_temp_dir() -> std::io::Result<PathBuf> {
-    use std::hash::{BuildHasher, Hasher};
-    let mut last = None;
-    for _ in 0..16 {
-        // RandomState is seeded randomly (per process, then varied per instance)
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        h.write_u128(now);
-        h.write_u32(std::process::id());
-        let dir = std::env::temp_dir().join(format!("fflv-view-{:016x}", h.finish()));
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        match builder.create(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
-            Err(e) => return Err(e),
-        }
-    }
-    Err(last.expect("tried"))
-}
-
 /// The message of a caught panic.
 fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
     p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default()
 }
 
 impl ViewServer {
+    fn media_dir(&self) -> &Path {
+        &self.media_dir
+    }
+
+    /// Where an export goes, and its format; Err((HTTP status, message)).
+    fn export_dest(&self, r: &ExportRequest) -> std::result::Result<(PathBuf, &'static str), (u16, String)> {
+        let dir = self.media_dir();
+        let stem = Path::new(&self.media_name).file_stem().map_or("export".into(), |s| s.to_string_lossy());
+        let dest = match r.path.as_deref().map(str::trim) {
+            None => dir.join(format!("{stem}.{}", r.format)),
+            Some(p) => {
+                let home = std::env::var_os("HOME").map(PathBuf::from);
+                let p = match (p.strip_prefix("~/").or(if p == "~" { Some("") } else { None }), home) {
+                    (Some(rest), Some(home)) => home.join(rest),
+                    _ => PathBuf::from(p),
+                };
+                if p.is_absolute() {
+                    p
+                } else {
+                    dir.join(p)
+                }
+            }
+        };
+        let bad = |status, msg: String| Err((status, msg));
+        if dest.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return bad(400, format!("{}: give the path without \"..\"", dest.display()));
+        }
+        if !self.loopback_only && !dest.starts_with(dir) {
+            return bad(
+                403,
+                format!("this server listens on a network address: exports can only be written in {}", dir.display()),
+            );
+        }
+        let ext = dest.extension().map(|e| e.to_string_lossy()).unwrap_or_default();
+        let Some(format) = export_format(&ext) else {
+            let exts: Vec<String> = EXPORT_FORMATS.iter().map(|(f, _)| format!(".{f}")).collect();
+            return bad(400, format!("{}: the file name must end in {}", dest.display(), exts.join(", ")));
+        };
+        if !dest.parent().is_some_and(Path::is_dir) {
+            return bad(400, format!("{}: no such directory", dest.parent().unwrap_or(dir).display()));
+        }
+        if dest.is_dir() {
+            return bad(400, format!("{} is a directory", dest.display()));
+        }
+        Ok((dest, format))
+    }
+
     fn handle_export(&self, mut req: Request, path: &str) -> std::io::Result<()> {
         let rest: Vec<&str> = path.trim_start_matches("/export").trim_start_matches('/').split('/').collect();
         let method = req.method().clone();
@@ -545,7 +632,10 @@ impl ViewServer {
             (Method::Get, [""]) => {
                 let formats: Vec<&str> = EXPORT_FORMATS.iter().map(|(f, _)| *f).collect();
                 let media = format!("/media/{}", percent_encode(&self.media_name));
-                req.respond(json_response(200, &json!({ "media": media, "formats": formats })))
+                let stem = Path::new(&self.media_name).file_stem().map_or("export".into(), |s| s.to_string_lossy());
+                let info = json!({ "media": media, "formats": formats, "dir": self.media_dir().to_string_lossy(),
+                                   "stem": stem, "sep": std::path::MAIN_SEPARATOR.to_string() });
+                req.respond(json_response(200, &info))
             }
             (Method::Post, [""]) => {
                 if !is_json(&req) {
@@ -557,12 +647,19 @@ impl ViewServer {
                 if body.len() as u64 > MAX_EXPORT_REQUEST {
                     return req.respond(json_error(413, "export request too large"));
                 }
-                match parse_export(&body) {
-                    Ok((format, opts)) => match self.start_export(format, opts) {
-                        Ok(id) => req.respond(json_response(202, &json!({ "id": id }))),
-                        Err(msg) => req.respond(json_error(409, &msg)),
-                    },
-                    Err(msg) => req.respond(json_error(400, &msg)),
+                let r = match parse_export(&body) {
+                    Ok(r) => r,
+                    Err(msg) => return req.respond(json_error(400, &msg)),
+                };
+                let (dest, format) = match self.export_dest(&r) {
+                    Ok(d) => d,
+                    Err((status, msg)) => return req.respond(json_error(status, &msg)),
+                };
+                match self.start_export(dest, format, r.opts, r.overwrite) {
+                    Ok((id, dest)) => {
+                        req.respond(json_response(202, &json!({ "id": id, "path": dest.to_string_lossy() })))
+                    }
+                    Err((status, v)) => req.respond(json_response(status, &v)),
                 }
             }
             (Method::Get, [_]) => match lock(&self.export).as_ref().filter(|e| Some(e.id) == id) {
@@ -591,11 +688,11 @@ impl ViewServer {
                 let Ok(f) = File::open(&file) else { return req.respond(json_error(404, "the exported file is gone")) };
                 let mime =
                     EXPORT_FORMATS.iter().find(|(f, _)| *f == format).map_or("application/octet-stream", |(_, m)| m);
-                let stem = Path::new(&self.media_name).file_stem().map_or("export".into(), |s| s.to_string_lossy());
+                let name = file.file_name().map_or("export".into(), |n| n.to_string_lossy());
                 req.respond(
                     Response::from_file(f)
                         .with_header(header("Content-Type", mime))
-                        .with_header(header("Content-Disposition", &content_disposition(&format!("{stem}.{format}"))))
+                        .with_header(header("Content-Disposition", &content_disposition(&name)))
                         .with_header(header("Cache-Control", "no-store"))
                         .with_chunked_threshold(usize::MAX),
                 )
@@ -604,29 +701,31 @@ impl ViewServer {
         }
     }
 
-    /// Start rendering in the background; Err when another export is still running.
-    fn start_export(&self, format: &'static str, opts: RenderOptions) -> std::result::Result<u64, String> {
+    /// Start rendering `dest` in the background. Err((409, …)) when another export is running or
+    /// `dest` exists (with `"exists": true`) and may not be overwritten.
+    fn start_export(
+        &self,
+        dest: PathBuf,
+        format: &'static str,
+        opts: RenderOptions,
+        overwrite: bool,
+    ) -> std::result::Result<(u64, PathBuf), (u16, Value)> {
         let mut slot = lock(&self.export);
         if slot.as_ref().is_some_and(|e| e.state == ExportState::Running) {
-            return Err("an export is already running".into());
+            return Err((409, json!({ "error": "an export is already running" })));
         }
-        if let Some(old) = slot.take() {
-            let _ = fs::remove_file(&old.path);
+        if !overwrite && dest.exists() {
+            let msg = format!("{} already exists", dest.display());
+            return Err((409, json!({ "error": msg, "exists": true, "path": dest.to_string_lossy() })));
         }
         let id = NEXT_EXPORT.fetch_add(1, Ordering::Relaxed);
-        let out = {
-            let mut dir = lock(&self.export_dir);
-            if dir.is_none() {
-                *dir = Some(private_temp_dir().map_err(|e| format!("cannot create a temporary directory: {e}"))?);
-            }
-            dir.as_ref().expect("just set").join(format!("export-{id}.{format}"))
-        };
+        let partial = partial_path(&dest, id, format);
         // claimed here (the name must not exist), then overwritten by the render
         File::options()
             .write(true)
             .create_new(true)
-            .open(&out)
-            .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
+            .open(&partial)
+            .map_err(|e| (500, json!({ "error": format!("cannot create {}: {e}", partial.display()) })))?;
         *slot = Some(Export {
             id,
             state: ExportState::Running,
@@ -634,10 +733,10 @@ impl ViewServer {
             done: 0,
             total: 0,
             cancel: false,
-            path: out.clone(),
+            path: dest.clone(),
             format,
         });
-        let (jobs, media) = (self.export.clone(), self.media.clone());
+        let (jobs, media, target) = (self.export.clone(), self.media.clone(), dest.clone());
         std::thread::spawn(move || {
             let mut progress = |done: u32, total: u32| -> Result<()> {
                 let mut slot = lock(&jobs);
@@ -651,16 +750,25 @@ impl ViewServer {
             };
             // a panic must not leave the export "running" (refusing every later one) or its file
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                render(&media, &out.to_string_lossy(), &opts, Some(&mut progress))
+                render(&media, &partial.to_string_lossy(), &opts, Some(&mut progress))
             }))
             .unwrap_or_else(|p| Err(Error::Output(format!("the export failed: {}", panic_message(&*p)))));
             let mut slot = lock(&jobs);
             let Some(e) = slot.as_mut().filter(|e| e.id == id) else {
-                let _ = fs::remove_file(&out);
+                let _ = fs::remove_file(&partial);
                 return;
             };
+            let result = result.and_then(|_| {
+                if !overwrite && target.exists() {
+                    return Err(Error::Output(format!(
+                        "{} was created while exporting; not replaced",
+                        target.display()
+                    )));
+                }
+                fs::rename(&partial, &target).map_err(Error::from)
+            });
             e.state = match result {
-                Ok(_) => ExportState::Done,
+                Ok(()) => ExportState::Done,
                 Err(_) if e.cancel => ExportState::Cancelled,
                 Err(err) => {
                     e.error = Some(err.to_string());
@@ -668,10 +776,10 @@ impl ViewServer {
                 }
             };
             if e.state != ExportState::Done {
-                let _ = fs::remove_file(&out);
+                let _ = fs::remove_file(&partial);
             }
         });
-        Ok(id)
+        Ok((id, dest))
     }
 }
 
@@ -785,25 +893,35 @@ mod tests {
 
     #[test]
     fn export_requests() {
-        let (format, o) =
-            parse_export(br#"{"format": "webm", "layers": ["bg", "1"], "opacity": {"bg": 0.5}}"#).unwrap();
-        assert_eq!(format, "webm");
-        assert_eq!(o.layers, Some(vec!["bg".to_string(), "1".to_string()]));
-        assert_eq!(o.opacity, vec![("bg".to_string(), 0.5)]);
-        assert!(!o.transparent && o.start == 0 && o.end.is_none() && o.order.is_none());
-        let (_, o) = parse_export(br#"{"layers": ["a"], "order": ["b", "a"]}"#).unwrap();
-        assert_eq!(o.order, Some(vec!["b".to_string(), "a".to_string()]));
+        let r = parse_export(br#"{"format": "webm", "layers": ["bg", "1"], "opacity": {"bg": 0.5}}"#).unwrap();
+        assert_eq!(r.format, "webm");
+        assert_eq!(r.opts.layers, Some(vec!["bg".to_string(), "1".to_string()]));
+        assert_eq!(r.opts.opacity, vec![("bg".to_string(), 0.5)]);
+        assert!(!r.opts.transparent && r.opts.start == 0 && r.opts.end.is_none() && r.opts.order.is_none());
+        assert!(r.path.is_none() && !r.overwrite);
+        let r = parse_export(
+            br#"{"layers": ["a"], "order": ["b", "a"], "start": 10, "end": 20, "path": "x.mkv", "overwrite": true}"#,
+        )
+        .unwrap();
+        assert_eq!(r.opts.order, Some(vec!["b".to_string(), "a".to_string()]));
+        assert_eq!((r.opts.start, r.opts.end, r.path.as_deref(), r.overwrite), (10, Some(20), Some("x.mkv"), true));
         assert!(parse_export(br#"{"layers": [], "order": "a"}"#).is_err());
-        assert_eq!(parse_export(br#"{"layers": []}"#).unwrap().0, "mp4");
+        assert_eq!(parse_export(br#"{"layers": []}"#).unwrap().format, "mp4");
         assert!(parse_export(br#"{"format": "gif", "layers": []}"#).is_err());
         assert!(parse_export(br#"{"format": "mp4"}"#).is_err());
         assert!(parse_export(br#"{"layers": [1]}"#).is_err());
         assert!(parse_export(br#"{"layers": [], "opacity": {"bg": 2}}"#).is_err());
+        assert!(parse_export(br#"{"layers": [], "start": 5, "end": 5}"#).is_err());
+        assert!(parse_export(br#"{"layers": [], "start": -1}"#).is_err());
+        assert!(parse_export(br#"{"layers": [], "path": ""}"#).is_err());
         assert!(parse_export(b"layers").is_err());
         assert_eq!(
             content_disposition("débug \"a\".mp4"),
             "attachment; filename=\"d_bug _a_.mp4\"; filename*=UTF-8''d%C3%A9bug%20%22a%22.mp4"
         );
+        let p = partial_path(Path::new("/d/clip.mp4"), 7, "mp4");
+        assert_eq!(p.parent(), Some(Path::new("/d")));
+        assert!(p.file_name().unwrap().to_string_lossy().starts_with(".clip.mp4.") && p.extension().unwrap() == "mp4");
     }
 
     #[test]
@@ -818,17 +936,17 @@ mod tests {
     }
 
     #[test]
-    fn private_dirs_and_panics() {
-        let (a, b) = (private_temp_dir().unwrap(), private_temp_dir().unwrap());
-        assert_ne!(a, b);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&a).unwrap().permissions().mode() & 0o077, 0);
-        }
-        fs::remove_dir(a).unwrap();
-        fs::remove_dir(b).unwrap();
+    fn panic_messages() {
         let p = std::panic::catch_unwind(|| -> u8 { panic!("boom {}", 1) }).unwrap_err();
         assert_eq!(panic_message(&*p), "boom 1");
+    }
+
+    #[test]
+    fn a_port_held_on_loopback_is_not_free() {
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        assert!(!port_is_free(held.local_addr().unwrap().port()));
+        let port = held.local_addr().unwrap().port();
+        drop(held);
+        assert!(port_is_free(port));
     }
 }

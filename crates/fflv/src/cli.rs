@@ -135,7 +135,7 @@ enum Cmd {
     /// Serve the interactive player (Chrome / Edge) and print its URL
     View {
         file: PathBuf,
-        /// Default: the first free port from 8765
+        /// Default: 8765, or the next free port up to 8775
         #[arg(long, default_value_t = 0)]
         port: u16,
         #[arg(long, default_value = "127.0.0.1")]

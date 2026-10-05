@@ -84,9 +84,22 @@ export function bindUi(player: Player): void {
   const resizer = $<HTMLDivElement>('side-resize');
   const thumbBgs = [...document.querySelectorAll<HTMLInputElement>('input[name=thumb-bg]')];
   const exportBox = $<HTMLDivElement>('export');
-  const exportFormat = $<HTMLSelectElement>('export-format');
   const exportStatus = $<HTMLSpanElement>('export-status');
+  const exportDownload = $<HTMLAnchorElement>('export-download');
   const btnExport = $<HTMLButtonElement>('btn-export');
+  const exportPanel = $<HTMLFormElement>('export-panel');
+  const exportStart = $<HTMLInputElement>('export-start');
+  const exportEnd = $<HTMLInputElement>('export-end');
+  const exportIn = $<HTMLButtonElement>('export-in');
+  const exportOut = $<HTMLButtonElement>('export-out');
+  const exportAll = $<HTMLButtonElement>('export-all');
+  const exportRangeInfo = $<HTMLSpanElement>('export-range-info');
+  const exportFormat = $<HTMLSelectElement>('export-format');
+  const exportPath = $<HTMLInputElement>('export-path');
+  const exportError = $<HTMLParagraphElement>('export-error');
+  const exportClose = $<HTMLButtonElement>('export-close');
+  const seekRange = $<HTMLDivElement>('seek-range');
+  const exportKeys = document.querySelector<HTMLElement>('.export-keys')!;
 
   // ---- opening files ------------------------------------------------------------------------
   const open = (file: File) => {
@@ -167,7 +180,7 @@ export function bindUi(player: Player): void {
 
   // ---- keyboard ---------------------------------------------------------------------------------
   // Space: play/pause. ←/→ (or , .): one frame; with Shift: BIG_STEP frames. Home/End: first/last
-  // frame. G: type a frame number. 1–9 toggle the n-th layer of the panel, Shift+n solos it (again:
+  // frame. G: type a frame number. I / O: export from / to the frame on screen. 1–9 toggle the n-th layer of the panel, Shift+n solos it (again:
   // show all), 0 shows all.
   window.addEventListener(
     'keydown',
@@ -196,6 +209,11 @@ export function bindUi(player: Player): void {
       if (e.code === 'KeyG') {
         e.preventDefault();
         editFrame();
+        return;
+      }
+      if ((e.code === 'KeyI' || e.code === 'KeyO') && player.source && exportAvailable()) {
+        e.preventDefault();
+        (e.code === 'KeyI' ? markIn : markOut)();
         return;
       }
       const m = /^(Digit|Numpad)(\d)$/.exec(e.code);
@@ -274,60 +292,218 @@ export function bindUi(player: Player): void {
   }
 
   // ---- export (with `fflv view`) ------------------------------------------------------------------
-  // fflv renders the layers shown, at their opacities, to a video (like `fflv render`) and the page
-  // downloads it. Only for the file the server serves: a file opened here has no server behind it.
+  // fflv renders the layers shown, at their opacities and in the panel's order, over a range of
+  // frames, and writes the video where the user says (on the machine fflv runs on; nothing goes
+  // through the browser). Only for the file the server serves: a file opened here has no server.
   const EXPORT_POLL_MS = 400;
-  let exportMedia: string | null = null;
+  let exportInfo: { media: string; formats: string[]; dir: string; stem: string; sep: string } | null = null;
   /** Id of the export being rendered. */
   let exporting: number | null = null;
+  /** Frames to export, both included; null: the whole file. Kept while the page is open. */
+  let range: { from: number; to: number } | null = null;
+  /** The path was typed by the user (else it follows the range and the format). */
+  let pathEdited = false;
+  const exportAvailable = () => exportInfo !== null && player.sourceUrl === exportInfo.media;
   const exportMsg = (text: string, bad = false, title = text) => {
     exportStatus.textContent = text;
     exportStatus.title = title;
     exportStatus.classList.toggle('bad', bad);
   };
   const updateExport = () => {
-    exportBox.hidden = exportMedia === null || player.sourceUrl !== exportMedia;
+    const available = exportAvailable();
+    exportBox.hidden = !available;
+    exportKeys.hidden = !available;
+    if (!available) closeExportPanel();
     btnExport.disabled = exporting === null && !player.source;
-    btnExport.textContent = exporting === null ? 'Export video' : 'Cancel export';
-    exportFormat.disabled = exporting !== null;
+    btnExport.textContent = exporting === null ? 'Export…' : 'Cancel export';
+    updateRange();
   };
+
+  /** The range in force: `range` within the file, or the whole file. */
+  const span = () => {
+    const last = lastFrame();
+    if (!range) return { from: 0, to: last, whole: true };
+    const from = Math.min(range.from, last);
+    const to = Math.max(from, Math.min(range.to, last));
+    return { from, to, whole: from === 0 && to === last };
+  };
+  const setRange = (from: number, to: number) => {
+    const last = lastFrame();
+    from = Math.max(0, Math.min(from, last));
+    to = Math.max(0, Math.min(to, last));
+    range = from === 0 && to === last ? null : { from: Math.min(from, to), to: Math.max(from, to) };
+    updateRange();
+  };
+  /** I / O: the frame on screen becomes the first / last frame; the other end moves if it must. */
+  const markIn = () => {
+    const f = player.currentFrame;
+    const s = span();
+    setRange(f, Math.max(f, s.to));
+  };
+  const markOut = () => {
+    const f = player.currentFrame;
+    const s = span();
+    setRange(Math.min(f, s.from), f);
+  };
+  const updateRange = () => {
+    const meta = player.source?.meta;
+    const s = span();
+    seekRange.hidden = !exportAvailable() || !meta || s.whole;
+    const last = Math.max(1, lastFrame());
+    seekRange.style.setProperty('--from', String(s.from / last));
+    seekRange.style.setProperty('--to', String(s.to / last));
+    seekRange.title = `Frames to export: ${s.from}–${s.to} (I / O)`;
+    if (exportPanel.hidden) return;
+    if (document.activeElement !== exportStart) exportStart.value = String(s.from);
+    if (document.activeElement !== exportEnd) exportEnd.value = String(s.to);
+    exportStart.classList.remove('bad');
+    exportEnd.classList.remove('bad');
+    if (meta) {
+      const n = s.to - s.from + 1;
+      const secs = (ptsUs(s.to + 1, meta.fps) - ptsUs(s.from, meta.fps)) / 1e6;
+      exportRangeInfo.textContent = `${n} frame${n === 1 ? '' : 's'} · ${secs.toFixed(2)} s · ${formatTime(ptsUs(s.from, meta.fps))} → ${formatTime(ptsUs(s.to, meta.fps))}`;
+    }
+    if (!pathEdited) exportPath.value = defaultPath();
+  };
+  const defaultPath = () => {
+    if (!exportInfo) return '';
+    const s = span();
+    const suffix = s.whole ? '' : `_${s.from}-${s.to}`;
+    return `${exportInfo.dir}${exportInfo.dir.endsWith(exportInfo.sep) ? '' : exportInfo.sep}${exportInfo.stem}${suffix}.${exportFormat.value}`;
+  };
+  /** The format a path's extension names, if any. */
+  const formatOf = (path: string) => {
+    const ext = /\.([^./\\]+)$/.exec(path)?.[1]?.toLowerCase();
+    return ext && exportInfo?.formats.includes(ext) ? ext : null;
+  };
+
+  const openExportPanel = () => {
+    exportError.hidden = true;
+    exportPanel.hidden = false;
+    btnExport.setAttribute('aria-expanded', 'true');
+    updateRange();
+    exportPath.scrollLeft = exportPath.scrollWidth; // the file name, at the end of a long path
+    exportStart.focus();
+    exportStart.select();
+  };
+  function closeExportPanel() {
+    if (exportPanel.hidden) return;
+    exportPanel.hidden = true;
+    btnExport.setAttribute('aria-expanded', 'false');
+    if (exportPanel.contains(document.activeElement)) btnExport.focus();
+  }
+  /** A frame field: a number within the file, or null (and marked). */
+  const frameField = (input: HTMLInputElement) => {
+    const v = input.value.trim();
+    const ok = /^\d+$/.test(v) && Number(v) <= lastFrame();
+    input.classList.toggle('bad', !ok);
+    return ok ? Number(v) : null;
+  };
+  const rangeFromFields = () => {
+    const from = frameField(exportStart);
+    const to = frameField(exportEnd);
+    if (from === null || to === null) return false;
+    if (from > to) {
+      exportEnd.classList.add('bad');
+      return false;
+    }
+    setRange(from, to);
+    return true;
+  };
+  for (const input of [exportStart, exportEnd]) {
+    input.addEventListener('change', () => rangeFromFields());
+  }
+  exportIn.addEventListener('click', markIn);
+  exportOut.addEventListener('click', markOut);
+  exportAll.addEventListener('click', () => {
+    range = null;
+    updateRange();
+  });
+  exportFormat.addEventListener('change', () => {
+    pref.set('exportFormat', exportFormat.value);
+    if (pathEdited) exportPath.value = exportPath.value.replace(/(\.[^./\\]*)?$/, `.${exportFormat.value}`);
+    updateRange();
+  });
+  exportPath.addEventListener('input', () => {
+    pathEdited = exportPath.value.trim() !== '';
+    const f = formatOf(exportPath.value);
+    if (f && f !== exportFormat.value) {
+      exportFormat.value = f;
+      pref.set('exportFormat', f);
+    }
+  });
+  exportClose.addEventListener('click', closeExportPanel);
+  exportPanel.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    e.stopPropagation();
+    closeExportPanel();
+  });
+  document.addEventListener('pointerdown', (e) => {
+    if (!exportPanel.hidden && !exportBox.contains(e.target as Node)) closeExportPanel();
+  });
+
   const api = async (url: string, init?: RequestInit) => {
     const r = await fetch(url, { cache: 'no-store', ...init });
     const body = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(body.error ?? `${r.status} ${r.statusText}`);
+    if (!r.ok) throw Object.assign(new Error(body.error ?? `${r.status} ${r.statusText}`), { body });
     return body;
   };
-  const download = (url: string) => {
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = ''; // the server names the file
-    document.body.append(a);
-    a.click();
-    a.remove();
-  };
-  const startExport = async () => {
+  const postJson = (url: string, body: unknown) =>
+    api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const baseName = (path: string) => path.split(/[/\\]/).pop() || path;
+
+  /** Start the export the panel describes; false (with the reason shown) when it did not start. */
+  const startExport = async (): Promise<boolean> => {
     const source = player.source;
-    if (!source) return;
-    const format = exportFormat.value;
+    if (!source || !rangeFromFields()) return false;
+    const s = span();
     const shown = source.meta.layers.flatMap((L, i) => (player.layerStates[i].visible ? [[L.id, player.layerStates[i].opacity] as const] : []));
-    const order = player.layerOrder.map((i) => source.meta.layers[i].id);
-    const request = { format, layers: shown.map(([id]) => id), opacity: Object.fromEntries(shown), order };
-    const name = `${source.name.replace(/\.[^.]*$/, '') || 'export'}.${format}`;
+    const request = {
+      layers: shown.map(([id]) => id),
+      opacity: Object.fromEntries(shown),
+      order: player.layerOrder.map((i) => source.meta.layers[i].id),
+      start: s.from,
+      end: s.to + 1,
+      format: exportFormat.value,
+      path: exportPath.value.trim() || defaultPath(),
+      overwrite: false,
+    };
+    let started: { id: number; path: string };
     try {
-      exportMsg('exporting…');
-      const { id } = await api('/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request) });
-      exporting = id;
-      updateExport();
+      try {
+        started = await postJson('/export', request);
+      } catch (e) {
+        const body = (e as { body?: { exists?: boolean; path?: string } }).body;
+        if (!body?.exists || !window.confirm(`${body.path} already exists.\nReplace it?`)) throw e;
+        started = await postJson('/export', { ...request, overwrite: true });
+      }
+    } catch (e) {
+      exportError.textContent = (e as Error).message;
+      exportError.hidden = false;
+      return false;
+    }
+    void followExport(started.id, started.path);
+    return true;
+  };
+  const followExport = async (id: number, path: string) => {
+    exporting = id;
+    exportDownload.hidden = true;
+    exportMsg('exporting…', false, `exporting to ${path}`);
+    updateExport();
+    try {
       for (;;) {
         await new Promise((r) => window.setTimeout(r, EXPORT_POLL_MS));
         const s = await api(`/export/${id}`);
         if (s.state === 'running') {
-          exportMsg(s.total ? `exporting ${Math.floor((100 * s.done) / s.total)}% (${s.done}/${s.total})` : 'exporting…');
+          exportMsg(s.total ? `exporting ${Math.floor((100 * s.done) / s.total)}% (${s.done}/${s.total})` : 'exporting…', false, `exporting to ${path}`);
           continue;
         }
         if (s.state === 'done') {
-          download(`/export/${id}/file`);
-          exportMsg(`exported ${name}`);
+          exportMsg(`saved ${baseName(path)}`, false, `saved to ${path}`);
+          exportDownload.href = `/export/${id}/file`;
+          exportDownload.title = `Download ${baseName(path)} through the browser (it is already saved to ${path})`;
+          exportDownload.hidden = false;
         } else if (s.state === 'cancelled') {
           exportMsg('export cancelled');
         } else {
@@ -342,20 +518,21 @@ export function bindUi(player: Player): void {
       updateExport();
     }
   };
+  exportPanel.addEventListener('submit', (e) => {
+    e.preventDefault();
+    void startExport().then((ok) => ok && closeExportPanel());
+  });
   blurAfterMouse(btnExport);
   btnExport.addEventListener('click', () => {
-    if (exporting === null) void startExport();
-    else void fetch(`/export/${exporting}/cancel`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-  });
-  exportFormat.addEventListener('change', () => {
-    pref.set('exportFormat', exportFormat.value);
-    exportFormat.blur(); // Space and the arrow keys drive the player again
+    if (exporting !== null) void postJson(`/export/${exporting}/cancel`, {}).catch(() => {});
+    else if (exportPanel.hidden) openExportPanel();
+    else closeExportPanel();
   });
   // `fflv view` answers with what it can export; any other server (or none) does not.
   void api('/export')
-    .then((info: { media?: string; formats?: string[] }) => {
-      if (!info.media || !info.formats?.length) return;
-      exportMedia = info.media;
+    .then((info: { media?: string; formats?: string[]; dir?: string; stem?: string; sep?: string }) => {
+      if (!info.media || !info.formats?.length || info.dir === undefined) return;
+      exportInfo = { media: info.media, formats: info.formats, dir: info.dir, stem: info.stem ?? 'export', sep: info.sep ?? '/' };
       for (const f of info.formats) exportFormat.add(new Option(f, f));
       const saved = pref.get('exportFormat');
       exportFormat.value = saved && info.formats.includes(saved) ? saved : info.formats[0];

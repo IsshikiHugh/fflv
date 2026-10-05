@@ -37,8 +37,12 @@ reloads automatically when the file changes on disk.
   Move up / Move down.
 - Drag a layer row to change the draw order; "reset order" goes back to the file's z order. Like
   visibility and opacity, this changes what the player shows and exports, not the file.
-- **Export video** (top right): fflv renders the layers shown, at their opacities and in the panel's order, to an MP4,
-  WebM, MOV or MKV file (as `fflv render` does), and the browser downloads it. Not available for a
+- **Export…** (top right): fflv renders the layers shown, at their opacities and in the panel's
+  order, over a range of frames to an MP4, WebM, MOV or MKV file (as `fflv render` does) and
+  writes it where you say, on the machine running `fflv view` (by default next to the .lvd;
+  relative paths are relative to its folder). <kbd>I</kbd> / <kbd>O</kbd> set the first / last
+  frame to the one on screen; the range shows under the seek bar. An existing file is replaced
+  only after asking; a "download" link fetches a copy through the browser. Not available for a
   file opened with "Open .lvd…" or dropped on the page. Exports have no sound.
 
 The player sources are in `player/`.

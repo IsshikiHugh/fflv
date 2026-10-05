@@ -14,8 +14,36 @@
         <div id="file-name" class="file-name">no file loaded</div>
         <div id="export" class="export" hidden>
           <span id="export-status" class="export-status" role="status" aria-live="polite"></span>
-          <select id="export-format" class="export-format" aria-label="Export format" title="Video format of the export"></select>
-          <button id="btn-export" class="btn ghost" type="button" title="Render the layers shown, at their opacities, to a video file (with fflv, like fflv render)">Export video</button>
+          <a id="export-download" class="export-download" hidden download>download</a>
+          <button id="btn-export" class="btn ghost" type="button" aria-haspopup="dialog" aria-expanded="false" title="Render the layers shown, at their opacities and in the panel's order, to a video file">Export…</button>
+          <form id="export-panel" class="export-panel" role="dialog" aria-label="Export video" hidden>
+            <h3>Export video</h3>
+            <p class="export-note">The layers shown, at their opacities and in the panel's order. fflv writes the file on the machine it runs on.</p>
+            <div class="export-grid">
+              <span class="export-label">Frames</span>
+              <div class="export-range">
+                <input id="export-start" class="export-num" type="text" inputmode="numeric" size="6" aria-label="First frame" />
+                <span class="dim">–</span>
+                <input id="export-end" class="export-num" type="text" inputmode="numeric" size="6" aria-label="Last frame (included)" />
+                <button id="export-in" class="mini" type="button" title="First frame = the frame on screen (I)">current → first</button>
+                <button id="export-out" class="mini" type="button" title="Last frame = the frame on screen (O)">current → last</button>
+                <button id="export-all" class="mini" type="button" title="The whole file">all</button>
+              </div>
+              <span></span>
+              <span id="export-range-info" class="export-info"></span>
+              <label class="export-label" for="export-format">Format</label>
+              <div><select id="export-format" class="export-format"></select></div>
+              <label class="export-label" for="export-path">Save to</label>
+              <input id="export-path" class="export-path" type="text" spellcheck="false" autocomplete="off" />
+              <span></span>
+              <span class="export-info">Relative paths are relative to the .lvd's folder; <code>~</code> is the home folder.</span>
+            </div>
+            <p id="export-error" class="export-error" hidden role="alert"></p>
+            <div class="export-actions">
+              <button id="export-close" class="btn ghost" type="button">Close</button>
+              <button id="export-go" class="btn" type="submit">Export</button>
+            </div>
+          </form>
         </div>
         <button id="btn-open" class="btn" type="button">Open .lvd…</button>
         <input id="file-input" type="file" accept=".lvd,.lvf" hidden />
@@ -63,7 +91,10 @@
                 <svg viewBox="0 0 24 24"><path d="M17 5h2v14h-2zM4 5v14l11-7z" /></svg>
               </button>
             </div>
-            <input id="seek" class="seek" type="range" min="0" max="0" value="0" step="1" aria-label="Position" />
+            <div class="seek-wrap">
+              <input id="seek" class="seek" type="range" min="0" max="0" value="0" step="1" aria-label="Position" />
+              <div id="seek-range" class="seek-range" hidden title="Frames to export (I / O)"></div>
+            </div>
             <div class="readout">
               <span id="time">00:00.000</span><span class="dim"> / <span id="duration">00:00.000</span></span>
             </div>
@@ -118,6 +149,7 @@
             <span><kbd>Home</kbd><kbd>End</kbd> first/last</span> · <span><kbd>G</kbd> go to frame</span><br />
             <span><kbd>1</kbd>–<kbd>9</kbd> show/hide layer</span> · <span><kbd>0</kbd> show all</span><br />
             <span><kbd>⇧</kbd>+<kbd>1</kbd>–<kbd>9</kbd> or <kbd>⌥</kbd>+click eye: only that layer</span>
+            <span class="export-keys"><br /><kbd>I</kbd><kbd>O</kbd> export from / to this frame</span>
           </p>
         </aside>
       </main>

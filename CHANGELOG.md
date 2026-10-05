@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Player: the export panel ("Export…") takes a range of frames (fields, or I / O
+  on the frame on screen; shown under the seek bar) and a path: fflv writes the video there
+  directly (next to the .lvd by default), instead of the browser downloading it. An existing file
+  is replaced only after asking; a "download" link still fetches a copy. On a non-loopback address
+  exports stay inside the .lvd's folder.
+- `POST /export` takes `start`, `end`, `path` and `overwrite`; `GET /export` also returns the
+  .lvd's folder and name.
+- `fflv view` without `--port` tries 8765 and then at most 10 ports after it (it tried 100, then
+  any port), and skips a port another process holds on 127.0.0.1 also when listening on another
+  address (such as an ssh tunnel's: binding 0.0.0.0 there succeeded, but requests reached the
+  tunnel).
+
 ## 0.4.0 (2026-10-01)
 
 - The built web player is no longer tracked: building fflv (`cargo build`, `maturin develop`,

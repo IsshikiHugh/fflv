@@ -9,6 +9,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -35,6 +36,16 @@ class Server:
         self.proc.wait()
         self.proc.stdout.close()
         self.proc.stderr.close()
+
+
+def free_port():
+    """A port free on every address: listening on 0.0.0.0 at a port another process holds on
+    127.0.0.1 (an ssh tunnel, say) succeeds, but requests to it then reach that process."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
 
 
 @pytest.fixture
@@ -158,7 +169,7 @@ def test_request_bodies_are_limited(server):
 
 
 def test_non_loopback_host_warns_and_still_checks_the_host(packed):
-    srv = Server(packed["path"], "--host", "0.0.0.0")
+    srv = Server(packed["path"], "--host", "0.0.0.0", "--port", str(free_port()))
     try:
         assert get(srv.media_url, {"Range": "bytes=0-3"})[0] == 206  # Host: an IP address
         assert get(srv.media_url, {"Host": "evil.example.com", "Range": "bytes=0-3"})[0] == 403
@@ -177,6 +188,41 @@ def test_the_page_is_not_opened_by_default(packed, args):
     out = srv.proc.stdout.read()
     srv.stop()
     assert "opened in" not in out
+
+
+def test_the_default_port_moves_on_at_most_ten_ports(packed):
+    """8765, else the next free port up to 8775; a port another process holds on 127.0.0.1 is
+    taken even for a server on 0.0.0.0 (binding there would succeed, but requests would not
+    reach it)."""
+    import socket
+
+    held = {}
+    for port in range(8765, 8776):
+        s = socket.socket()
+        # like a server: a port left in TIME_WAIT by an earlier test can be listened on again
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            s.listen()
+            held[port] = s
+        except OSError:
+            s.close()  # in use already
+    try:
+        res = subprocess.run([sys.executable, "-m", "fflv", "view", str(packed["path"]), "--host", "0.0.0.0"],
+                             capture_output=True, text=True, timeout=30)
+        assert res.returncode != 0 and "8765–8775 are all in use" in res.stderr
+        if not held:
+            pytest.skip("every port from 8765 to 8775 is used by other processes")
+        port = max(held)
+        held.pop(port).close()
+        srv = Server(packed["path"], "--host", "0.0.0.0")
+        try:
+            assert srv.base.endswith(f":{port}")
+        finally:
+            srv.stop()
+    finally:
+        for s in held.values():
+            s.close()
 
 
 def test_open_and_no_open_conflict(packed):
@@ -228,66 +274,144 @@ def layered(tmp_path):
     srv.stop()
 
 
-def export(srv, request, tmp_path):
-    """Run one export to the end; returns (final status, the downloaded file or None, its headers)."""
-    st, _, body = post(f"{srv.base}/export", request)
-    assert st == 202, body
-    eid = json.loads(body)["id"]
-    deadline = time.monotonic() + 60
+def wait_export(srv, eid, timeout=60):
+    deadline = time.monotonic() + timeout
     while True:
         st, _, body = get(f"{srv.base}/export/{eid}")
         status = json.loads(body)
         assert st == 200 and status["id"] == eid
         if status["state"] != "running":
-            break
+            return status
         assert time.monotonic() < deadline, status
         time.sleep(0.05)
+
+
+def export(srv, request, tmp_path):
+    """Run one export to the end (into tmp_path/out unless the request names a path); returns
+    (final status, the file written or None)."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(exist_ok=True)
+    request = {"path": str(out_dir / f"e{len(list(out_dir.iterdir()))}.{request.get('format', 'mp4')}"), **request}
+    st, _, body = post(f"{srv.base}/export", request)
+    assert st == 202, body
+    started = json.loads(body)
+    status = wait_export(srv, started["id"])
+    assert status["path"] == started["path"]
+    dest = Path(started["path"])
+    assert not [p.name for p in dest.parent.iterdir() if "fflv-tmp" in p.name]  # no partial file left
     if status["state"] != "done":
-        return status, None, None
-    st, h, data = get(f"{srv.base}/export/{eid}/file")
-    assert st == 200 and int(h["Content-Length"]) == len(data)
-    out = tmp_path / f"export-{eid}.{request.get('format', 'mp4')}"
-    out.write_bytes(data)
-    return status, out, h
+        assert not dest.exists() or request.get("overwrite")
+        return status, None
+    return status, dest
 
 
 def test_export_renders_the_layers_shown_at_their_opacities(layered, tmp_path):
     srv, path = layered
     st, _, body = get(f"{srv.base}/export")
-    assert st == 200 and json.loads(body) == {"media": "/media/layered.lvd", "formats": ["mp4", "webm", "mov", "mkv"]}
+    assert st == 200 and json.loads(body) == {"media": "/media/layered.lvd", "formats": ["mp4", "webm", "mov", "mkv"],
+                                             "dir": str(path.parent), "stem": "layered", "sep": os.sep}
 
     # a layer hidden in the file, shown in the player
-    status, out, h = export(srv, {"format": "mkv", "layers": ["bg", "hidden"]}, tmp_path)
+    status, out = export(srv, {"format": "mkv", "layers": ["bg", "hidden"]}, tmp_path)
     assert status["done"] == status["total"] == N
-    assert h["Content-Type"] == "video/x-matroska" and 'filename="layered.mkv"' in h["Content-Disposition"]
     fflv.render(path, tmp_path / "want.mkv", layers=["bg", "hidden"])
     got, want = read_video(out), read_video(tmp_path / "want.mkv")
     assert len(got) == N and all(np.array_equal(a, b) for a, b in zip(got, want))
     assert tuple(got[3][2, 2]) == (255, 255, 255)
+    # the file can also be downloaded through the browser
+    st, h, data = get(f"{srv.base}/export/{status['id']}/file")
+    assert st == 200 and data == out.read_bytes() and h["Content-Type"] == "video/x-matroska"
+    assert f'filename="{out.name}"' in h["Content-Disposition"]
 
     # opacity 0 is the same as hidden; 0.5 mixes with what is below
-    _, out, _ = export(srv, {"format": "mkv", "layers": ["bg", "dot"], "opacity": {"dot": 0}}, tmp_path)
+    _, out = export(srv, {"format": "mkv", "layers": ["bg", "dot"], "opacity": {"dot": 0}}, tmp_path)
     fflv.render(path, tmp_path / "bg.mkv", layers=["bg"])
     assert all(np.array_equal(a, b) for a, b in zip(read_video(out), read_video(tmp_path / "bg.mkv")))
-    _, out, _ = export(srv, {"format": "mkv", "layers": ["bg", "dot"], "opacity": {"dot": 0.5, "bg": 1}}, tmp_path)
+    _, out = export(srv, {"format": "mkv", "layers": ["bg", "dot"], "opacity": {"dot": 0.5, "bg": 1}}, tmp_path)
     px = read_video(out)[4][18, 18].astype(int)  # the dot over bg (40, 0, 0)
     assert np.abs(px - (148, 128, 128)).max() <= 2
 
     # the draw order: bg (opaque, full canvas) moved over the dot covers it
-    status, out, _ = export(srv, {"format": "mkv", "layers": ["bg", "dot"], "order": ["dot", "bg", "hidden"]}, tmp_path)
+    _, out = export(srv, {"format": "mkv", "layers": ["bg", "dot"], "order": ["dot", "bg", "hidden"]}, tmp_path)
     assert all(np.array_equal(a, b) for a, b in zip(read_video(out), read_video(tmp_path / "bg.mkv")))
 
-    # H.264 by default; the previous export's file is gone once a new one starts
-    previous = f"{srv.base}/export/{status['id']}/file"
-    assert get(previous)[0] == 200
-    status, out, h = export(srv, {"layers": ["bg", "dot"]}, tmp_path)
-    assert h["Content-Type"] == "video/mp4" and len(read_video(out)) == N
-    assert get(previous)[0] == 404
-    status, _, _ = export(srv, {"format": "mkv", "layers": ["bg"], "order": ["nope"]}, tmp_path)
+    # a range of frames, [start, end)
+    status, out = export(srv, {"format": "mkv", "layers": ["bg"], "start": 3, "end": 7}, tmp_path)
+    assert status["total"] == 4
+    assert all(np.array_equal(a, b) for a, b in zip(read_video(out), read_video(tmp_path / "bg.mkv")[3:7], strict=True))
+    status, _ = export(srv, {"layers": ["bg"], "start": 5, "end": N + 1}, tmp_path)
+    assert status["state"] == "failed"
+
+    # H.264 by default; the path's extension picks the format
+    _, out = export(srv, {"layers": ["bg", "dot"]}, tmp_path)
+    assert out.suffix == ".mp4" and len(read_video(out)) == N
+    _, out = export(srv, {"format": "mp4", "layers": ["bg"], "path": str(tmp_path / "out" / "x.webm")}, tmp_path)
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(out)],
+                           capture_output=True, text=True, check=True)
+    assert probe.stdout.strip() == "vp9"
+    status, _ = export(srv, {"format": "mkv", "layers": ["bg"], "order": ["nope"]}, tmp_path)
     assert status["state"] == "failed" and "nope" in status["error"]
 
 
-def test_export_errors_and_cancel(layered, tmp_path):
+def test_export_paths(layered, tmp_path):
+    srv, path = layered
+    url = f"{srv.base}/export"
+    # no path: <stem>.<format> next to the .lvd; an existing file is only replaced when asked
+    st, _, body = post(url, {"layers": ["bg"], "format": "mkv"})
+    started = json.loads(body)
+    assert st == 202 and started["path"] == str(path.with_suffix(".mkv"))
+    assert wait_export(srv, started["id"])["state"] == "done"
+    first = path.with_suffix(".mkv").read_bytes()
+    st, _, body = post(url, {"layers": ["bg", "dot"], "format": "mkv"})
+    assert st == 409 and json.loads(body)["exists"] is True and json.loads(body)["path"] == str(path.with_suffix(".mkv"))
+    assert path.with_suffix(".mkv").read_bytes() == first
+    st, _, body = post(url, {"layers": ["bg", "dot"], "format": "mkv", "overwrite": True})
+    assert st == 202 and wait_export(srv, json.loads(body)["id"])["state"] == "done"
+    assert path.with_suffix(".mkv").read_bytes() != first
+
+    # relative to the .lvd's folder, which must exist
+    assert post(url, {"layers": ["bg"], "path": "clips/a.mp4"})[0] == 400
+    (tmp_path / "clips").mkdir()
+    st, _, body = post(url, {"layers": ["bg"], "path": "clips/a.mp4"})
+    assert st == 202 and json.loads(body)["path"] == str(tmp_path / "clips" / "a.mp4")
+    assert wait_export(srv, json.loads(body)["id"])["state"] == "done" and (tmp_path / "clips" / "a.mp4").stat().st_size
+
+    st, _, body = post(url, {"layers": ["bg"], "path": "clips/a.gif"})
+    assert st == 400 and ".mp4" in json.loads(body)["error"]
+    assert post(url, {"layers": ["bg"], "path": "clips/../b.mp4"})[0] == 400
+    assert post(url, {"layers": ["bg"], "path": "clips"})[0] == 400
+    assert post(url, {"layers": ["bg"], "path": str(tmp_path / "clips") + "/"})[0] == 400
+
+
+def test_export_cancel_leaves_nothing(layered, tmp_path):
+    srv, _ = layered
+    url = f"{srv.base}/export"
+    dest = tmp_path / "cancelled.mkv"
+    st, _, body = post(url, {"layers": ["bg", "dot"], "path": str(dest)})
+    eid = json.loads(body)["id"]
+    assert post(url, {"layers": ["bg"], "path": str(tmp_path / "other.mp4")})[0] == 409  # one at a time
+    assert post(f"{url}/{eid}/cancel", {}, content_type="text/plain")[0] == 415  # no cross-site cancel
+    assert post(f"{url}/{eid}/cancel", {})[0] == 200
+    assert wait_export(srv, eid, 30)["state"] == "cancelled"
+    assert get(f"{url}/{eid}/file")[0] == 404
+    assert not dest.exists() and not [p for p in tmp_path.iterdir() if "fflv-tmp" in p.name]
+    assert post(url, {"layers": ["bg"], "path": str(tmp_path / "other.mp4")})[0] == 202  # free again
+
+
+def test_export_on_a_network_address_stays_in_the_folder(tmp_path, layered):
+    _, path = layered
+    srv = Server(path, "--host", "0.0.0.0", "--port", str(free_port()))
+    try:
+        base = srv.base.replace("0.0.0.0", "127.0.0.1")
+        st, _, body = post(f"{base}/export", {"layers": ["bg"], "path": str(tmp_path.parent / "outside.mp4")})
+        assert st == 403 and "network" in json.loads(body)["error"]
+        st, _, body = post(f"{base}/export", {"layers": ["bg"], "path": "inside.mp4"})
+        assert st == 202
+    finally:
+        srv.stop()
+
+
+def test_export_errors(layered, tmp_path):
     srv, _ = layered
     url = f"{srv.base}/export"
     assert post(url, {"layers": []}, content_type="text/plain")[0] == 415  # no simple cross-site POSTs
@@ -295,19 +419,8 @@ def test_export_errors_and_cancel(layered, tmp_path):
     assert post(url, {"layers": "bg"})[0] == 400
     assert post(url, b"{")[0] == 400
     assert post(url, {"layers": [], "opacity": {"bg": 1.5}})[0] == 400
+    assert post(url, {"layers": [], "start": 4, "end": 4})[0] == 400
     assert get(url, {"Host": "evil.example.com"})[0] == 403
     assert get(f"{url}/99")[0] == 404 and get(f"{url}/99/file")[0] == 404
-    status, out, _ = export(srv, {"layers": ["nope"]}, tmp_path)
+    status, out = export(srv, {"layers": ["nope"]}, tmp_path)
     assert status["state"] == "failed" and "nope" in status["error"] and out is None
-
-    st, _, body = post(url, {"layers": ["bg", "dot"], "format": "mkv"})
-    eid = json.loads(body)["id"]
-    assert post(url, {"layers": ["bg"]})[0] == 409  # one at a time
-    assert post(f"{url}/{eid}/cancel", {}, content_type="text/plain")[0] == 415  # no cross-site cancel
-    assert post(f"{url}/{eid}/cancel", {})[0] == 200
-    deadline = time.monotonic() + 30
-    while (state := json.loads(get(f"{url}/{eid}")[2])["state"]) == "running":
-        assert time.monotonic() < deadline
-        time.sleep(0.05)
-    assert state == "cancelled" and get(f"{url}/{eid}/file")[0] == 404
-    assert post(url, {"layers": ["bg"]})[0] == 202  # free again
