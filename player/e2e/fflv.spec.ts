@@ -350,10 +350,13 @@ test('export: a range of frames (I / O), written by fflv where the user says', a
   await expect(page.locator('#export-status')).toHaveText('export cancelled');
   expect(fs.readdirSync(path.dirname(whole)).filter((n) => n.includes('whole') || n.includes('fflv-tmp'))).toEqual([]);
 
-  // a file opened in the page itself is not the one fflv serves: no export, no I / O
+  // a file opened in the page itself is not the one fflv serves: only the browser can export it
   await page.setInputFiles('#file-input', TEST_FILE);
   await page.waitForFunction(() => window.__lvf.player.mode === 'paused' && window.__lvf.player.sourceUrl === null);
-  await expect(page.locator('#export')).toBeHidden();
+  await expect(page.locator('#export')).toBeVisible();
+  await page.locator('#btn-export').click();
+  await expect(page.locator('#export-engine')).toBeHidden();
+  await expect(page.locator('#export-path')).toBeHidden();
   await expect(page.locator('#seek-range')).toBeHidden();
 });
 

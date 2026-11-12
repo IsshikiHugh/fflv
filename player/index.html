@@ -18,8 +18,15 @@
           <button id="btn-export" class="btn ghost" type="button" aria-haspopup="dialog" aria-expanded="false" title="Render the layers shown, at their opacities and in the panel's order, to a video file">Export…</button>
           <form id="export-panel" class="export-panel" role="dialog" aria-label="Export video" hidden>
             <h3>Export video</h3>
-            <p class="export-note">The layers shown, at their opacities and in the panel's order. fflv writes the file on the machine it runs on.</p>
+            <p id="export-note" class="export-note"></p>
             <div class="export-grid">
+              <label id="export-engine-label" class="export-label" for="export-engine">Render</label>
+              <div id="export-engine-row">
+                <select id="export-engine" class="export-format">
+                  <option value="browser">in this browser</option>
+                  <option value="fflv">by fflv, on the machine it runs on</option>
+                </select>
+              </div>
               <span class="export-label">Frames</span>
               <div class="export-range">
                 <input id="export-start" class="export-num" type="text" inputmode="numeric" size="6" aria-label="First frame" />
@@ -33,10 +40,10 @@
               <span id="export-range-info" class="export-info"></span>
               <label class="export-label" for="export-format">Format</label>
               <div><select id="export-format" class="export-format"></select></div>
-              <label class="export-label" for="export-path">Save to</label>
-              <input id="export-path" class="export-path" type="text" spellcheck="false" autocomplete="off" />
-              <span></span>
-              <span class="export-info">Relative paths are relative to the .lvd's folder; <code>~</code> is the home folder.</span>
+              <label class="export-label export-fflv" for="export-path">Save to</label>
+              <input id="export-path" class="export-path export-fflv" type="text" spellcheck="false" autocomplete="off" />
+              <span class="export-fflv"></span>
+              <span class="export-info export-fflv">Relative paths are relative to the .lvd's folder; <code>~</code> is the home folder.</span>
             </div>
             <p id="export-error" class="export-error" hidden role="alert"></p>
             <div class="export-actions">

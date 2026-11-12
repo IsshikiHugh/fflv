@@ -5,6 +5,7 @@ import { formatTime, ptsUs } from '../format/timing';
 import { isActive, type LayerMeta } from '../format/lvf';
 import { moveTo } from '../format/order';
 import type { Player } from '../player';
+import { canExportInBrowser, exportInBrowser } from '../export/browserExport';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -42,6 +43,12 @@ const pref = {
     }
   },
 };
+
+/** `window.showSaveFilePicker` (File System Access; Chrome and Edge). */
+type SaveFilePicker = (options: {
+  suggestedName?: string;
+  types?: { description?: string; accept: Record<string, string[]> }[];
+}) => Promise<FileSystemFileHandle>;
 
 export function bindUi(player: Player): void {
   const stage = $<HTMLDivElement>('stage');
@@ -100,6 +107,11 @@ export function bindUi(player: Player): void {
   const exportClose = $<HTMLButtonElement>('export-close');
   const seekRange = $<HTMLDivElement>('seek-range');
   const exportKeys = document.querySelector<HTMLElement>('.export-keys')!;
+  const exportNote = $<HTMLParagraphElement>('export-note');
+  const exportEngine = $<HTMLSelectElement>('export-engine');
+  const exportEngineLabel = $<HTMLLabelElement>('export-engine-label');
+  const exportEngineRow = $<HTMLDivElement>('export-engine-row');
+  const fflvOnly = [...document.querySelectorAll<HTMLElement>('.export-fflv')];
 
   // ---- opening files ------------------------------------------------------------------------
   const open = (file: File) => {
@@ -291,32 +303,59 @@ export function bindUi(player: Player): void {
     });
   }
 
-  // ---- export (with `fflv view`) ------------------------------------------------------------------
-  // fflv renders the layers shown, at their opacities and in the panel's order, over a range of
-  // frames, and writes the video where the user says (on the machine fflv runs on; nothing goes
-  // through the browser). Only for the file the server serves: a file opened here has no server.
+  // ---- export ---------------------------------------------------------------------------------------
+  // The layers shown, at their opacities and in the panel's order, over a range of frames, go to a
+  // video file. Two ways:
+  //  - in this browser (WebCodecs, MP4): for any file, and the only way on a static page;
+  //  - by fflv (`fflv view`, the file it serves only): fflv renders and writes the file where the
+  //    user says, on the machine it runs on (nothing goes through the browser).
   const EXPORT_POLL_MS = 400;
+  const BROWSER_FORMATS = ['mp4'];
   let exportInfo: { media: string; formats: string[]; dir: string; stem: string; sep: string } | null = null;
-  /** Id of the export being rendered. */
-  let exporting: number | null = null;
+  /** The export running: how to cancel it. */
+  let exporting: { cancel: () => void } | null = null;
+  /** Object URL of the last export kept in memory (the download link), revoked by the next one. */
+  let exportBlobUrl: string | null = null;
   /** Frames to export, both included; null: the whole file. Kept while the page is open. */
   let range: { from: number; to: number } | null = null;
   /** The path was typed by the user (else it follows the range and the format). */
   let pathEdited = false;
-  const exportAvailable = () => exportInfo !== null && player.sourceUrl === exportInfo.media;
+  /** fflv serves the file on screen, so it can render it. */
+  const fflvAvailable = () => exportInfo !== null && player.sourceUrl === exportInfo.media;
+  const exportAvailable = () => fflvAvailable() || canExportInBrowser();
+  /** Who renders: the choice when fflv can, else the browser. */
+  const engine = (): 'browser' | 'fflv' => (fflvAvailable() && exportEngine.value === 'fflv' ? 'fflv' : 'browser');
   const exportMsg = (text: string, bad = false, title = text) => {
     exportStatus.textContent = text;
     exportStatus.title = title;
     exportStatus.classList.toggle('bad', bad);
   };
   const updateExport = () => {
-    const available = exportAvailable();
+    const available = exportAvailable() && (fflvAvailable() || !!player.source || exporting !== null);
     exportBox.hidden = !available;
     exportKeys.hidden = !available;
     if (!available) closeExportPanel();
     btnExport.disabled = exporting === null && !player.source;
     btnExport.textContent = exporting === null ? 'Export…' : 'Cancel export';
+    updateEngine();
     updateRange();
+  };
+  /** The panel's rows and formats for the engine in force. */
+  const updateEngine = () => {
+    const fflv = fflvAvailable();
+    exportEngineLabel.hidden = exportEngineRow.hidden = !fflv;
+    const e = engine();
+    for (const el of fflvOnly) el.hidden = e !== 'fflv';
+    exportNote.textContent =
+      e === 'fflv'
+        ? "The layers shown, at their opacities and in the panel's order. fflv writes the file on the machine it runs on."
+        : "The layers shown, at their opacities and in the panel's order. This browser renders the video (no sound) and asks where to save it.";
+    const formats = e === 'fflv' ? exportInfo!.formats : BROWSER_FORMATS;
+    if ([...exportFormat.options].map((o) => o.value).join() !== formats.join()) {
+      exportFormat.replaceChildren(...formats.map((f) => new Option(f, f)));
+      const saved = e === 'fflv' ? pref.get('exportFormat') : null;
+      exportFormat.value = saved && formats.includes(saved) ? saved : formats[0];
+    }
   };
 
   /** The range in force: `range` within the file, or the whole file. */
@@ -453,10 +492,23 @@ export function bindUi(player: Player): void {
     api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const baseName = (path: string) => path.split(/[/\\]/).pop() || path;
 
+  const showExportError = (msg: string) => {
+    exportError.textContent = msg;
+    exportError.hidden = false;
+  };
+  const showDownload = (href: string, name: string | null, title: string) => {
+    exportDownload.href = href;
+    if (name === null) exportDownload.setAttribute('download', '');
+    else exportDownload.download = name;
+    exportDownload.title = title;
+    exportDownload.hidden = false;
+  };
+
   /** Start the export the panel describes; false (with the reason shown) when it did not start. */
   const startExport = async (): Promise<boolean> => {
     const source = player.source;
     if (!source || !rangeFromFields()) return false;
+    if (engine() === 'browser') return startBrowserExport();
     const s = span();
     const shown = source.meta.layers.flatMap((L, i) => (player.layerStates[i].visible ? [[L.id, player.layerStates[i].opacity] as const] : []));
     const request = {
@@ -479,15 +531,14 @@ export function bindUi(player: Player): void {
         started = await postJson('/export', { ...request, overwrite: true });
       }
     } catch (e) {
-      exportError.textContent = (e as Error).message;
-      exportError.hidden = false;
+      showExportError((e as Error).message);
       return false;
     }
     void followExport(started.id, started.path);
     return true;
   };
   const followExport = async (id: number, path: string) => {
-    exporting = id;
+    exporting = { cancel: () => void postJson(`/export/${id}/cancel`, {}).catch(() => {}) };
     exportDownload.hidden = true;
     exportMsg('exporting…', false, `exporting to ${path}`);
     updateExport();
@@ -501,9 +552,7 @@ export function bindUi(player: Player): void {
         }
         if (s.state === 'done') {
           exportMsg(`saved ${baseName(path)}`, false, `saved to ${path}`);
-          exportDownload.href = `/export/${id}/file`;
-          exportDownload.title = `Download ${baseName(path)} through the browser (it is already saved to ${path})`;
-          exportDownload.hidden = false;
+          showDownload(`/export/${id}/file`, null, `Download ${baseName(path)} through the browser (it is already saved to ${path})`);
         } else if (s.state === 'cancelled') {
           exportMsg('export cancelled');
         } else {
@@ -518,24 +567,86 @@ export function bindUi(player: Player): void {
       updateExport();
     }
   };
+  /**
+   * Render in this browser. The file is chosen first, while the click still counts as a user
+   * gesture (the save picker needs one); without a picker the video is kept in memory and offered
+   * as a download.
+   */
+  const startBrowserExport = async (): Promise<boolean> => {
+    const source = player.source!;
+    const s = span();
+    const name = `${source.name.replace(/\.[^.]*$/, '') || 'export'}${s.whole ? '' : `_${s.from}-${s.to}`}.mp4`;
+    let file: FileSystemFileHandle | null = null;
+    const picker = (window as { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker;
+    if (picker) {
+      try {
+        file = await picker({ suggestedName: name, types: [{ description: 'MP4 video', accept: { 'video/mp4': ['.mp4'] } }] });
+      } catch (e) {
+        if ((e as Error).name === 'AbortError') return false; // the user closed the picker
+        showExportError((e as Error).message);
+        return false;
+      }
+    }
+    const saved = file?.name ?? name;
+    const ctl = new AbortController();
+    exporting = { cancel: () => ctl.abort() };
+    exportDownload.hidden = true;
+    if (exportBlobUrl) URL.revokeObjectURL(exportBlobUrl);
+    exportBlobUrl = null;
+    exportMsg('exporting…', false, `exporting to ${saved}`);
+    updateExport();
+    void exportInBrowser({
+      source,
+      states: player.layerStates.map((st) => ({ ...st })),
+      order: [...player.layerOrder],
+      alphaRangeFix: player.compositor.alphaRangeFix,
+      from: s.from,
+      to: s.to,
+      file,
+      signal: ctl.signal,
+      onProgress: (done, total) => exportMsg(`exporting ${Math.floor((100 * done) / total)}% (${done}/${total})`, false, `exporting to ${saved}`),
+    })
+      .then((r) => {
+        const lost = r.lost ? `; ${r.lost} frame${r.lost === 1 ? '' : 's'} could not be decoded` : '';
+        exportMsg(`saved ${saved}${lost}`, r.lost > 0);
+        if (r.blob) {
+          exportBlobUrl = URL.createObjectURL(r.blob);
+          showDownload(exportBlobUrl, saved, `Save ${saved} again`);
+          exportDownload.click();
+        }
+      })
+      .catch((e: Error) => {
+        if (e.name === 'AbortError') exportMsg('export cancelled');
+        else exportMsg(`export failed: ${e.message.split('\n')[0]}`, true, e.message);
+      })
+      .finally(() => {
+        exporting = null;
+        updateExport();
+      });
+    return true;
+  };
+
   exportPanel.addEventListener('submit', (e) => {
     e.preventDefault();
     void startExport().then((ok) => ok && closeExportPanel());
   });
   blurAfterMouse(btnExport);
   btnExport.addEventListener('click', () => {
-    if (exporting !== null) void postJson(`/export/${exporting}/cancel`, {}).catch(() => {});
+    if (exporting !== null) exporting.cancel();
     else if (exportPanel.hidden) openExportPanel();
     else closeExportPanel();
   });
-  // `fflv view` answers with what it can export; any other server (or none) does not.
+  exportEngine.value = pref.get('exportEngine') === 'browser' ? 'browser' : 'fflv';
+  exportEngine.addEventListener('change', () => {
+    pref.set('exportEngine', exportEngine.value);
+    exportError.hidden = true;
+    updateExport();
+  });
+  // `fflv view` answers with what it can export; any other server (or none, a static page) does not.
   void api('/export')
     .then((info: { media?: string; formats?: string[]; dir?: string; stem?: string; sep?: string }) => {
       if (!info.media || !info.formats?.length || info.dir === undefined) return;
       exportInfo = { media: info.media, formats: info.formats, dir: info.dir, stem: info.stem ?? 'export', sep: info.sep ?? '/' };
-      for (const f of info.formats) exportFormat.add(new Option(f, f));
-      const saved = pref.get('exportFormat');
-      exportFormat.value = saved && info.formats.includes(saved) ? saved : info.formats[0];
       updateExport();
     })
     .catch(() => {});

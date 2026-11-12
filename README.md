@@ -37,13 +37,22 @@ reloads automatically when the file changes on disk.
   Move up / Move down.
 - Drag a layer row to change the draw order; "reset order" goes back to the file's z order. Like
   visibility and opacity, this changes what the player shows and exports, not the file.
-- **Export…** (top right): fflv renders the layers shown, at their opacities and in the panel's
-  order, over a range of frames to an MP4, WebM, MOV or MKV file (as `fflv render` does) and
-  writes it where you say, on the machine running `fflv view` (by default next to the .lvd;
-  relative paths are relative to its folder). <kbd>I</kbd> / <kbd>O</kbd> set the first / last
-  frame to the one on screen; the range shows under the seek bar. An existing file is replaced
-  only after asking; a "download" link fetches a copy through the browser. Not available for a
-  file opened with "Open .lvd…" or dropped on the page. Exports have no sound.
+- **Export…** (top right) renders the layers shown, at their opacities and in the panel's order,
+  over a range of frames to a video file. <kbd>I</kbd> / <kbd>O</kbd> set the first / last frame
+  to the one on screen; the range shows under the seek bar. Exports have no sound. Two ways
+  ("Render"):
+  - **by fflv** (only for the file `fflv view` serves; the default there): an MP4, WebM, MOV or
+    MKV file, as `fflv render` does, written where you say on the machine running `fflv view` (by
+    default next to the .lvd; relative paths are relative to its folder). An existing file is
+    replaced only after asking; a "download" link fetches a copy through the browser.
+  - **in this browser** (any file, also one opened with "Open .lvd…" or dropped on the page): an
+    MP4 (H.264, or VP9 where the browser has no H.264 encoder), encoded with WebCodecs; the
+    browser asks where to save it. Colors and the padding of odd sizes follow `fflv render`.
+
+The player also works as a static page, without fflv: [isshikihugh.github.io/fflv](https://isshikihugh.github.io/fflv/)
+(built from `player/` by [`.github/workflows/pages.yml`](.github/workflows/pages.yml)). Open or
+drop an .lvd there (it is read in place, never uploaded), or pass `?src=<url>` for one served with
+range requests (another origin must allow it through CORS and expose `Content-Range` and `ETag`).
 
 The player sources are in `player/`.
 

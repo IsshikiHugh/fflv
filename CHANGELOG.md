@@ -9,6 +9,10 @@
   exports stay inside the .lvd's folder.
 - `POST /export` takes `start`, `end`, `path` and `overwrite`; `GET /export` also returns the
   .lvd's folder and name.
+- Player: exports can also render in the browser (WebCodecs, MP4: H.264 or VP9), with no fflv:
+  for files opened in the page, and as a choice ("Render") under `fflv view`. BT.709 limited
+  range and even-size padding as in `fflv render`; saved with the browser's save dialog.
+- The player is published as a static page on GitHub Pages (`.github/workflows/pages.yml`).
 - `fflv view` without `--port` tries 8765 and then at most 10 ports after it (it tried 100, then
   any port), and skips a port another process holds on 127.0.0.1 also when listening on another
   address (such as an ssh tunnel's: binding 0.0.0.0 there succeeded, but requests reached the
