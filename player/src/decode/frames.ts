@@ -34,11 +34,84 @@ export interface LumaPlane {
   timestamp: number;
 }
 
+/**
+ * The coded planes of a color frame (8-bit Y, U, V; or Y and interleaved UV for NV12), copied out of
+ * its VideoFrame so that the compositor converts them to RGB itself: the browser's conversion is
+ * not exact (Chrome/Edge get the blue of saturated BT.709 colors wrong by up to ~10 levels).
+ * `data` holds the whole copied frame (a pooled buffer); `layout` gives each plane's offset and
+ * stride in it.
+ */
+export interface ColorPlanes {
+  data: Uint8Array;
+  layout: PlaneLayout[];
+  format: ColorFormat;
+  width: number;
+  height: number;
+  timestamp: number;
+  /** (Kr, Kb) of the YUV matrix, or 'rgb' for G, B, R planes (lossless layers). */
+  matrix: [number, number] | 'rgb';
+  fullRange: boolean;
+}
+
+export type ColorFormat = 'I420' | 'I422' | 'I444' | 'NV12';
+const COLOR_FORMATS = new Set<string>(['I420', 'I422', 'I444', 'NV12']);
+
 export interface LayerPlanes {
+  /** Color plane kept as a VideoFrame (only when its pixel format cannot be copied as planes). */
   color: VideoFrame | null;
+  colorPlanes: ColorPlanes | null;
   /** Alpha plane kept as a VideoFrame (only when its pixel format cannot be copied as luma). */
   alpha: VideoFrame | null;
   alphaLuma: LumaPlane | null;
+}
+
+export function hasCopyablePlanes(frame: VideoFrame): boolean {
+  return frame.format !== null && COLOR_FORMATS.has(frame.format);
+}
+
+/** (Kr, Kb) for a VideoFrame's matrix; like fflv, anything else (or none) is BT.709. */
+function matrixOf(m: string | null | undefined): [number, number] {
+  switch (m) {
+    case 'bt470bg':
+    case 'smpte170m':
+      return [0.299, 0.114];
+    case 'bt2020-ncl':
+      return [0.2627, 0.0593];
+    default:
+      return [0.2126, 0.0722];
+  }
+}
+
+/**
+ * Copy the planes of a color frame. `rgb`: the planes are G, B, R (lossless layers are coded as
+ * RGB; Chrome reports no matrix for them).
+ */
+export async function extractPlanes(frame: VideoFrame, rgb: boolean): Promise<ColorPlanes> {
+  const rect = frame.visibleRect!;
+  const buf = takeBuffer(frame.allocationSize());
+  let layout: PlaneLayout[];
+  try {
+    layout = await frame.copyTo(buf);
+  } catch (e) {
+    recycle(buf);
+    throw e;
+  }
+  const cs = frame.colorSpace;
+  return {
+    data: buf,
+    layout,
+    format: frame.format as ColorFormat,
+    width: rect.width,
+    height: rect.height,
+    timestamp: frame.timestamp,
+    matrix: rgb || cs.matrix === 'rgb' ? 'rgb' : matrixOf(cs.matrix),
+    fullRange: cs.fullRange ?? false,
+  };
+}
+
+/** Give a color frame's buffer back to the pool; the planes must not be used afterwards. */
+export function releasePlanes(p: ColorPlanes | null): void {
+  if (p) recycle(p.data);
 }
 
 const LUMA_FIRST_FORMATS = new Set(['I420', 'I420A', 'I422', 'I444', 'NV12']);
@@ -48,11 +121,11 @@ export function hasCopyableLuma(frame: VideoFrame): boolean {
 }
 
 /**
- * Buffers of released luma planes, reused for the next copies (copyTo writes every plane, so each
+ * Buffers of released luma and color planes, reused for the next copies (copyTo writes every plane, so each
  * copy needs a whole frame's allocationSize; reusing them avoids that much garbage per frame).
  */
 const lumaPool: Uint8Array[] = [];
-const LUMA_POOL_MAX = 32;
+const LUMA_POOL_MAX = 64;
 
 function takeBuffer(size: number): Uint8Array {
   const i = lumaPool.findIndex((b) => b.byteLength === size);
@@ -111,6 +184,7 @@ export class CompositeFrame {
     this.closed = true;
     for (const p of this.planes.values()) {
       release(p.color);
+      releasePlanes(p.colorPlanes);
       release(p.alpha);
       releaseLuma(p.alphaLuma);
     }

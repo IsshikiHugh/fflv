@@ -91,6 +91,36 @@ test('lossless layer: every pixel arrives exactly (RGB and alpha)', async ({ pag
   }
 });
 
+test('lossy colors: each video layer drawn alone matches fflv render', async ({ page }) => {
+  // the browser's own YUV→RGB got saturated BT.709 blues wrong; the player converts like fflv
+  await openViaServer(page);
+  await seek(page, 100);
+  const { width, height } = await page.evaluate(() => window.__lvf.player.source!.meta.canvas);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fflv-e2e-colors-'));
+  try {
+    for (const id of ['bg', 'calib', 'sync_a']) {
+      const got = await page.evaluate((id) => {
+        const { player } = window.__lvf;
+        const states = player.source!.meta.layers.map((L) => ({ visible: L.id === id, opacity: 1 }));
+        player.compositor.draw(player.current, states);
+        const { width, height } = player.source!.meta.canvas;
+        const px = player.compositor.readPixels(0, 0, width, height);
+        let bin = '';
+        for (let i = 0; i < px.length; i += 0x8000) bin += String.fromCharCode(...px.subarray(i, i + 0x8000));
+        return btoa(bin); // far faster to hand over than an array of numbers
+      }, id).then((b64) => Buffer.from(b64, 'base64'));
+      const png = path.join(dir, `${id}.png`);
+      execFileSync(FFLV, ['render', TEST_FILE, '-l', id, '-f', '100', '-o', png], { stdio: 'ignore' });
+      const want = execFileSync('ffmpeg', ['-v', 'error', '-i', png, '-f', 'rawvideo', '-pix_fmt', 'rgba', '-'], { maxBuffer: 64 << 20 });
+      let off = 0;
+      for (let i = 0; i < width * height * 4; i++) if (i % 4 !== 3 && got[i] !== want[i]) off++;
+      expect(off, `${id}: channel values that differ`).toBe(0);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('number keys toggle, solo and restore layers', async ({ page }) => {
   await openViaServer(page);
   const visible = () => page.evaluate(() => window.__lvf.player.layerStates.map((s) => s.visible));

@@ -370,7 +370,7 @@ File ──► Reader (reads composite frames sequentially, read-ahead buffer)
 
 ### 9.6 Compositing (WebGL2)
 - Draw every layer that is "visible and active in this frame" in ascending `z`: a rectangle at the layer's `rect` in canvas coordinates.
-- Color texture: upload the VideoFrame directly with `texImage2D` (the browser does the YUV→RGB conversion).
+- Color texture: upload the VideoFrame directly with `texImage2D` (the browser does the YUV→RGB conversion). Superseded by A.13: the player converts the coded planes itself.
 - Alpha texture: upload the alpha stream's VideoFrame the same way; the shader reads `.r` as alpha.
   - Note that video may be limited range (16–235). It must be verified with the test material that alpha=0 and alpha=255 map to 0.0 and 1.0; if they do not, apply a range mapping in the shader (`clamp((v - 16/255) * 255/219, 0, 1)`) — the implementer decides from measurements whether it is needed.
 - Final alpha = alpha texture value × layer opacity. Colors are treated as straight (non-premultiplied) alpha.
@@ -473,7 +473,7 @@ Nothing here changes the format defined in sections 1–12; it records the concr
 - It copies the raw luma out with `VideoFrame.copyTo()`; the plane only counts as decoded when the copy is done (P1 still holds). The alpha VideoFrame is closed right after the copy.
 - The luma is uploaded as an R8 texture and the shader applies the range mapping from section 9.6, `clamp((v − 16/255)·255/219, 0, 1)`.
 
-Measured: alpha = 0 → 0.0 and alpha = 255 → 1.0, both exact; the largest deviation from the ideal ramp in between is 1.9 levels, which is lossy-coding noise. If a pixel format cannot be copied (rare), the player falls back to uploading the frame directly. Color planes are still converted by the browser, as section 9.6 says.
+Measured: alpha = 0 → 0.0 and alpha = 255 → 1.0, both exact; the largest deviation from the ideal ramp in between is 1.9 levels, which is lossy-coding noise. If a pixel format cannot be copied (rare), the player falls back to uploading the frame directly. Color planes are now converted by the player too (A.13).
 
 **A.4 Opus pre-skip.** Audio packet `pts_us` values are on the "decoder timeline": the first packet is at 0, as in WebM. The metadata `audio` object gains a `pre_skip` field (in 48 kHz samples, the same value as in the OpusHead); presentation time = decoder time − pre_skip. Measured: Chromium's AudioDecoder, given the OpusHead description, drops the pre-skip itself and outputs presentation timestamps — after every configure, including after a seek. The player detects from the size of the first output whether the decoder did this, and subtracts the pre-skip itself if not. The end-to-end tests confirm that the onset of every decoded beep lies within 0.1 ms of a whole second.
 
@@ -485,7 +485,7 @@ Measured: alpha = 0 → 0.0 and alpha = 255 → 1.0, both exact; the largest dev
 
 **A.8 Jump when too far behind.** When the video is more than 2 s behind the master clock (e.g. audio kept playing while the tab was hidden and rAF was suspended), the player seeks straight to the clock's frame instead of catching up frame by frame. Ordinary stalls are handled by P3: the clock stops after 100 ms and buffering starts, so the lag never builds up to 2 s.
 
-**A.9 Known browser issue.** In Edge 153, software-decoded VP9 frames uploaded to WebGL have the wrong chroma in the last pixel column (white becomes 198,255,187). Hardware decoding does not have this problem, nor does Chrome. Color planes are converted by the browser as section 9.6 says, so this is left as is; `?hw=prefer-hardware` avoids it. Alpha is not affected (see A.3).
+**A.9 Known browser issue.** In Edge 153, software-decoded VP9 frames uploaded to WebGL have the wrong chroma in the last pixel column (white becomes 198,255,187). Hardware decoding does not have this problem, nor does Chrome. Since A.13 the player no longer uploads color frames to WebGL (only frames whose pixel format cannot be copied still are), so this no longer shows. Alpha is not affected (see A.3).
 
 **A.10 Test material.** Homebrew's FFmpeg 8.1 is built without `drawtext`, so frame numbers are drawn with a built-in bitmap font. In addition, every video layer carries a barcode of its frame number (1 start bit + 16 data bits + 1 parity bit, 8×8-pixel cells). During playback, seeking, layer toggling and CPU throttling, the end-to-end tests read the barcodes of all visible layers back from the canvas and check, frame by frame, that they all equal the frame_index of the current composite frame.
 
@@ -497,6 +497,13 @@ Measured: alpha = 0 → 0.0 and alpha = 255 → 1.0, both exact; the largest dev
 - A short forward seek (e.g. stepping forward) does not reset the decoders when there is no RAP before the target or the distance is ≤ 8 frames: the pipeline produces the following composite frames in order anyway, and the whole frames in between are simply closed.
 
 Everything else follows section 9.7 exactly: `reset()` + `configure()` every decoder, decode from the nearest RAP at or before the target, drop complete composite frames with frame_index < T. Consecutive seek requests (dragging the progress bar, holding an arrow key) are coalesced; only the last one is carried out.
+
+**A.13 Color planes are converted by the player.** Measured (Chrome for Testing 153, GPU and SwiftShader alike): the browser's YUV→RGB conversion of a BT.709 limited-range VideoFrame (the frame reports `matrix: bt709`) gets red and green right but blue wrong for saturated colors, by up to about 10 levels: yellow Y = 218, U = 16, V = 138 becomes blue 11 instead of 0, magenta Y = 78, U = 214, V = 230 becomes 244 instead of 254 (the effective U→B factor is about 1.75 instead of 1.8556). So the player converts color planes as it does alpha (A.3):
+
+- The decoded frame (I420, I422, I444 or NV12) is copied out with `VideoFrame.copyTo()` and closed; the plane counts as decoded when the copy is done (P1).
+- The planes are uploaded as R8 (NV12's chroma as RG8) textures, and a pass of their own converts them into the layer's RGBA texture at the picture's size, with the formulas fflv uses (B.10): BT.601 / BT.709 / BT.2020 as the frame signals them (anything else BT.709), limited or full range, nearest-neighbour chroma, rounded half up. Lossless layers (B.2) are G, B, R planes and are copied as they are. Compositing then samples that texture as before.
+- The result is bit-identical to `fflv render` for every layer of the test material (Chrome with software and hardware decoding, Edge with software decoding), except ±1 in a few pixels of a scaled layer (bilinear filtering on the GPU). A pixel format that cannot be copied falls back to uploading the VideoFrame (the browser converts).
+- Cost: one copy per color plane per frame. Measured on the test material (5 video layers, 1280×720, 30 fps): playback still drops no frames; decoding and drawing as fast as possible goes from about 120 to about 105 frames/s, and with the CPU slowed down (×4) from about 20 to about 22 (the decoders get their frames back sooner).
 
 ---
 

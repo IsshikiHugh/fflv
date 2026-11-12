@@ -432,6 +432,7 @@ export class Player extends EventTarget {
     if (cf.ptsUs !== pts) problems.push(`composite pts ${cf.ptsUs} ≠ ${pts}`);
     for (const [li, pl] of cf.planes) {
       if (pl.color && pl.color.timestamp !== pts) problems.push(`layer ${li} color ts ${pl.color.timestamp}`);
+      if (pl.colorPlanes && pl.colorPlanes.timestamp !== pts) problems.push(`layer ${li} color ts ${pl.colorPlanes.timestamp}`);
       if (pl.alpha && pl.alpha.timestamp !== pts) problems.push(`layer ${li} alpha ts ${pl.alpha.timestamp}`);
       if (pl.alphaLuma && pl.alphaLuma.timestamp !== pts) problems.push(`layer ${li} alpha ts ${pl.alphaLuma.timestamp}`);
     }
@@ -440,7 +441,7 @@ export class Player extends EventTarget {
     for (const [li, L] of meta.layers.entries()) {
       if (L.kind !== 'video' || !isActive(L, cf.frameIndex)) continue;
       const pl = cf.planes.get(li);
-      if (!pl?.color || (L.has_alpha && !pl.alpha && !pl.alphaLuma)) {
+      if (!(pl?.color || pl?.colorPlanes) || (L.has_alpha && !pl.alpha && !pl.alphaLuma)) {
         problems.push(`layer ${li} is missing a plane`);
         p1 = true;
       }

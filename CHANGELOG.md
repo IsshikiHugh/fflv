@@ -12,6 +12,9 @@
 - Player: exports can also render in the browser (WebCodecs, MP4: H.264 or VP9), with no fflv:
   for files opened in the page, and as a choice ("Render") under `fflv view`. BT.709 limited
   range and even-size padding as in `fflv render`; saved with the browser's save dialog.
+- Player: color planes are converted to RGB by the player, with fflv's formulas, instead of by the
+  browser, whose BT.709 conversion got the blue of saturated colors wrong by up to ~10 levels. The
+  player (and exports in the browser) now match `fflv render` (LVF_SPEC.md A.13).
 - The player is published as a static page on GitHub Pages (`.github/workflows/pages.yml`).
 - `fflv view` without `--port` tries 8765 and then at most 10 ports after it (it tried 100, then
   any port), and skips a port another process holds on 127.0.0.1 also when listening on another

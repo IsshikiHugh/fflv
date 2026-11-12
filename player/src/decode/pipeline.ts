@@ -10,7 +10,7 @@
  *    frames are released strictly in frame order.
  *  - Back-pressure: ready + in-flight composite frames are capped (spec 9.4).
  */
-import { CompositeFrame, extractLuma, hasCopyableLuma, release, releaseLuma, type LayerPlanes } from './frames';
+import { CompositeFrame, extractLuma, extractPlanes, hasCopyableLuma, hasCopyablePlanes, release, releaseLuma, releasePlanes, type LayerPlanes } from './frames';
 import { PlaneDecoder, type PlaneKind, type PlaneSink } from './planeDecoder';
 import { ENTRY_FRAME, type AudioPacket, type ParsedCau, type VideoLayerMeta } from '../format/lvf';
 import type { LvfSource } from '../format/source';
@@ -302,28 +302,19 @@ export class DecodePipeline implements PlaneSink {
     }
     let slot = pend.planes.get(layer);
     if (!slot) {
-      slot = { color: null, alpha: null, alphaLuma: null };
+      slot = { color: null, colorPlanes: null, alpha: null, alphaLuma: null };
       pend.planes.set(layer, slot);
     }
+    // The plane counts as decoded once its pixels are copied out (P1); the VideoFrame goes back to
+    // the decoder right away. Formats that cannot be copied stay VideoFrames (the browser converts).
+    const s = slot;
     if (plane === 'alpha' && hasCopyableLuma(frame)) {
-      // The plane counts as decoded once its luma is copied out (P1); the VideoFrame goes back to
-      // the decoder right away.
-      const s = slot;
-      extractLuma(frame).then(
-        (luma) => {
-          release(frame);
-          if (this.pending.get(frameIndex) !== pend || s.alphaLuma) return releaseLuma(luma); // seeked away meanwhile
-          s.alphaLuma = luma;
-          if (--pend.remaining === 0) this.releaseComplete();
-        },
-        (err) => {
-          release(frame);
-          console.error('[lvf] alpha copy failed:', err);
-          if (this.pending.get(frameIndex) !== pend) return;
-          pend.broken = true;
-          if (--pend.remaining === 0) this.releaseComplete();
-        },
-      );
+      this.copyOut(frame, frameIndex, pend, 'alpha', extractLuma(frame), () => s.alphaLuma !== null, (luma) => (s.alphaLuma = luma), releaseLuma);
+      return;
+    }
+    if (plane === 'color' && hasCopyablePlanes(frame)) {
+      const rgb = (this.source.meta.layers[layer] as VideoLayerMeta).lossless === true; // coded as G, B, R
+      this.copyOut(frame, frameIndex, pend, 'color', extractPlanes(frame, rgb), () => s.colorPlanes !== null, (p) => (s.colorPlanes = p), releasePlanes);
       return;
     }
     if (slot[plane]) {
@@ -334,6 +325,34 @@ export class DecodePipeline implements PlaneSink {
     }
     slot[plane] = frame;
     if (pend.remaining === 0) this.releaseComplete();
+  }
+
+  /** Finish an asynchronous copy of a decoded plane: store it in its composite frame, or drop it. */
+  private copyOut<T>(
+    frame: VideoFrame,
+    frameIndex: number,
+    pend: Pending,
+    plane: PlaneKind,
+    copy: Promise<T>,
+    has: () => boolean,
+    store: (v: T) => void,
+    drop: (v: T) => void,
+  ): void {
+    copy.then(
+      (v) => {
+        release(frame);
+        if (this.pending.get(frameIndex) !== pend || has()) return drop(v); // seeked away meanwhile
+        store(v);
+        if (--pend.remaining === 0) this.releaseComplete();
+      },
+      (err) => {
+        release(frame);
+        console.error(`[lvf] ${plane} copy failed:`, err);
+        if (this.pending.get(frameIndex) !== pend) return;
+        pend.broken = true;
+        if (--pend.remaining === 0) this.releaseComplete();
+      },
+    );
   }
 
   onLost(_layer: number, _plane: PlaneKind, frameIndex: number): void {
@@ -393,6 +412,7 @@ export class DecodePipeline implements PlaneSink {
 function closePlanes(planes: Map<number, LayerPlanes>): void {
   for (const p of planes.values()) {
     release(p.color);
+    releasePlanes(p.colorPlanes);
     release(p.alpha);
     releaseLuma(p.alphaLuma);
   }

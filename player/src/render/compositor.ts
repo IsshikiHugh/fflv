@@ -2,7 +2,12 @@
  * WebGL2 compositor (spec 9.6). Draws one composite frame: every visible layer that is active in
  * that frame, in ascending z (or the order set with setOrder), as a textured rectangle at its canvas rect.
  *
- *  - Color planes are uploaded straight from the VideoFrame (the browser converts YUV → RGB).
+ *  - Color planes arrive as their coded Y, U, V planes and are converted to RGB here, in a pass of
+ *    their own at the picture's size, with the exact BT.601/709/2020 formulas and nearest-neighbour
+ *    chroma, as fflv does (spec B.10). Measured: Chrome/Edge's own conversion of a BT.709 VideoFrame
+ *    gets the blue of saturated colors wrong by up to ~10 levels (yellow Y=218 U=16 V=138 gives
+ *    blue 11, not 0). A frame whose pixel format cannot be copied is uploaded as a VideoFrame and
+ *    converted by the browser.
  *  - Alpha planes arrive as raw coded luma and are uploaded as R8. Limited-range alpha (Y 16..235,
  *    the default) gets the range mapping clamp((v − 16/255) · 255/219, 0, 1); full-range alpha
  *    (lossless layers) is used as is — either way alpha 0 → 0.0 and 255 → 1.0 exactly. (Measured: letting Chrome/Edge convert the alpha VideoFrame to RGB gives
@@ -15,7 +20,7 @@
  *    (texSubImage2D), instead of being reallocated by every upload.
  *  - A lost WebGL context is rebuilt when the browser restores it: program, textures, stills.
  */
-import type { CompositeFrame, LumaPlane } from '../decode/frames';
+import type { ColorFormat, ColorPlanes, CompositeFrame, LumaPlane } from '../decode/frames';
 import { isActive, type BlendMode, type LvfMeta } from '../format/lvf';
 import { zOrder } from '../format/order';
 
@@ -65,6 +70,44 @@ void main() {
   else outColor = vec4(c.rgb, a);                                    // with blendFunc(SRC_ALPHA, ...)
 }`;
 
+/** The YUV → RGB pass: one fragment per picture pixel, written to the layer's RGBA texture. */
+const VS_FULL = `#version 300 es
+in vec2 aPos;
+void main() {
+  gl_Position = vec4(aPos * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const FS_YUV = `#version 300 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D uY;
+uniform highp sampler2D uU;   // U, or interleaved UV (NV12)
+uniform highp sampler2D uV;
+uniform bool uNv12;
+uniform ivec2 uShift;         // chroma subsampling (log2) in x and y
+uniform bool uRgb;            // planes are G, B, R
+uniform vec2 uLuma;           // Y offset, Y scale
+uniform vec4 uCoef;           // V→R, U→G, V→G, U→B per chroma step
+out vec4 outColor;
+float fetch(sampler2D t, ivec2 p, int c) { return floor(texelFetch(t, p, 0)[c] * 255.0 + 0.5); }
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);   // row 0 of the target is the picture's top row, as in the planes
+  ivec2 c = p >> uShift;
+  float y = fetch(uY, p, 0);
+  float u = fetch(uU, c, 0);
+  float v = uNv12 ? fetch(uU, c, 1) : fetch(uV, c, 0);
+  vec3 rgb;
+  if (uRgb) {
+    rgb = vec3(v, y, u);
+  } else {
+    float l = (y - uLuma.x) * uLuma.y;
+    float cu = u - 128.0;
+    float cv = v - 128.0;
+    rgb = vec3(l + cv * uCoef.x, l + (cu * uCoef.y + cv * uCoef.z), l + cu * uCoef.w);
+  }
+  outColor = vec4(clamp(floor(rgb + 0.5), 0.0, 255.0) / 255.0, 1.0);
+}`;
+
 const BLEND_IDS: Record<BlendMode, number> = { normal: 0, add: 1, multiply: 2, screen: 3 };
 
 /** A texture with immutable storage of one size and format. */
@@ -76,7 +119,10 @@ interface SizedTexture {
 }
 
 interface VideoTextures {
+  /** RGB of the picture (the converted planes, or the uploaded VideoFrame). */
   color: SizedTexture | null;
+  /** The coded planes (Y, U or UV, V) of the last converted frame. */
+  planes: (SizedTexture | null)[];
   alpha: SizedTexture | null;
   hasAlpha: boolean;
   /** Identity of the composite frame whose planes are in the textures. */
@@ -94,6 +140,9 @@ export class Compositor {
   onRestored: () => void = () => {};
   private prog!: WebGLProgram;
   private readonly u: Record<string, WebGLUniformLocation | null> = {};
+  private yuvProg!: WebGLProgram;
+  private readonly yu: Record<string, WebGLUniformLocation | null> = {};
+  private yuvFbo!: WebGLFramebuffer;
   private meta: LvfMeta | null = null;
   private stillLoader: StillLoader | null = null;
   private order: number[] = [];
@@ -128,9 +177,15 @@ export class Compositor {
     const vbo = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
-    const loc = gl.getAttribLocation(this.prog, 'aPos');
-    gl.enableVertexAttribArray(loc);
-    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(0); // aPos, bound to 0 in both programs
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    this.yuvProg = link(gl, VS_FULL, FS_YUV);
+    for (const n of ['uY', 'uU', 'uV', 'uNv12', 'uShift', 'uRgb', 'uLuma', 'uCoef']) this.yu[n] = gl.getUniformLocation(this.yuvProg, n);
+    gl.useProgram(this.yuvProg);
+    gl.uniform1i(this.yu.uY, 0);
+    gl.uniform1i(this.yu.uU, 1);
+    gl.uniform1i(this.yu.uV, 2);
+    this.yuvFbo = gl.createFramebuffer()!;
     gl.useProgram(this.prog);
     gl.uniform1i(this.u.uColor, 0);
     gl.uniform1i(this.u.uAlpha, 1);
@@ -165,7 +220,7 @@ export class Compositor {
   /** Texture slots for the video layers; storage is allocated by the first upload. */
   private createVideoSlots(): void {
     for (const [i, L] of this.meta!.layers.entries()) {
-      if (L.kind === 'video') this.video.set(i, { color: null, alpha: null, hasAlpha: L.has_alpha, source: null });
+      if (L.kind === 'video') this.video.set(i, { color: null, planes: [], alpha: null, hasAlpha: L.has_alpha, source: null });
     }
   }
 
@@ -228,6 +283,12 @@ export class Compositor {
     const gl = this.gl;
     const meta = this.meta;
     if (this.lost) return;
+    if (meta && frame && !frame.isClosed) {
+      for (const li of this.order) {
+        const st = states[li];
+        if (st.visible && st.opacity > 0 && isActive(meta.layers[li], frame.frameIndex)) this.uploadLayer(frame, li);
+      }
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.disable(gl.BLEND);
@@ -275,13 +336,7 @@ export class Compositor {
       gl.uniform1i(this.u.uAlphaFull, L.alpha_range === 'full' ? 1 : 0);
       const planes = frame.planes.get(li);
       const tex = this.video.get(li)!;
-      if (!planes?.color) return null;
-      if (tex.source !== frame) {
-        tex.color = upload(gl, tex.color, planes.color, gl.BROWSER_DEFAULT_WEBGL);
-        if (tex.hasAlpha && planes.alphaLuma) tex.alpha = uploadLuma(gl, tex.alpha, planes.alphaLuma);
-        else if (tex.hasAlpha && planes.alpha) tex.alpha = upload(gl, tex.alpha, planes.alpha, gl.NONE);
-        tex.source = frame;
-      }
+      if (!(planes?.color || planes?.colorPlanes) || tex.source !== frame || !tex.color) return null;
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, tex.color!.tex);
       if (tex.alpha) {
@@ -300,6 +355,61 @@ export class Compositor {
   }
 
   /**
+   * Put video layer `li`'s planes of `frame` into its textures, unless they are there already. Runs
+   * before a draw sets its own state: a conversion pass changes the framebuffer, viewport, program
+   * and texture bindings.
+   */
+  private uploadLayer(frame: CompositeFrame, li: number): void {
+    const gl = this.gl;
+    const tex = this.video.get(li);
+    const planes = frame.planes.get(li);
+    if (!tex || !planes || tex.source === frame) return;
+    if (planes.colorPlanes) this.convert(tex, planes.colorPlanes);
+    else if (planes.color) tex.color = upload(gl, tex.color, planes.color, gl.BROWSER_DEFAULT_WEBGL);
+    else return;
+    if (tex.hasAlpha && planes.alphaLuma) tex.alpha = uploadLuma(gl, tex.alpha, planes.alphaLuma);
+    else if (tex.hasAlpha && planes.alpha) tex.alpha = upload(gl, tex.alpha, planes.alpha, gl.NONE);
+    tex.source = frame;
+  }
+
+  /** Upload the coded planes and convert them to RGB into `tex.color` (picture size). */
+  private convert(tex: VideoTextures, p: ColorPlanes): void {
+    const gl = this.gl;
+    const [sx, sy] = CHROMA_SHIFT[p.format];
+    const cw = (p.width + sx) >> sx;
+    const ch = (p.height + sy) >> sy;
+    const nv12 = p.format === 'NV12';
+    const L = p.layout;
+    gl.activeTexture(gl.TEXTURE0);
+    tex.color = sized(gl, tex.color, p.width, p.height, gl.RGBA8);
+    tex.planes[0] = uploadPlane(gl, tex.planes[0] ?? null, p.data, L[0], p.width, p.height, 1);
+    gl.activeTexture(gl.TEXTURE1);
+    tex.planes[1] = uploadPlane(gl, tex.planes[1] ?? null, p.data, L[1], cw, ch, nv12 ? 2 : 1);
+    gl.activeTexture(gl.TEXTURE2);
+    if (!nv12) tex.planes[2] = uploadPlane(gl, tex.planes[2] ?? null, p.data, L[2], cw, ch, 1);
+    else gl.bindTexture(gl.TEXTURE_2D, tex.planes[1].tex); // unused, but bound to something valid
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.yuvFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex.color.tex, 0);
+    gl.viewport(0, 0, p.width, p.height);
+    gl.disable(gl.BLEND);
+    gl.useProgram(this.yuvProg);
+    gl.uniform1i(this.yu.uNv12, nv12 ? 1 : 0);
+    gl.uniform2i(this.yu.uShift, sx, sy);
+    gl.uniform1i(this.yu.uRgb, p.matrix === 'rgb' ? 1 : 0);
+    if (p.matrix !== 'rgb') {
+      // the same numbers as fflv's YUV tables (crates/fflv/src/pixel.rs), rounded to f32 there too
+      const [kr, kb] = p.matrix;
+      const kg = 1 - kr - kb;
+      const cs = p.fullRange ? 1 : 255 / 224;
+      gl.uniform2f(this.yu.uLuma, p.fullRange ? 0 : 16, p.fullRange ? 1 : 255 / 219);
+      gl.uniform4f(this.yu.uCoef, 2 * (1 - kr) * cs, ((-2 * kb * (1 - kb)) / kg) * cs, ((-2 * kr * (1 - kr)) / kg) * cs, 2 * (1 - kb) * cs);
+    }
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.useProgram(this.prog);
+  }
+
+  /**
    * Render each of `layers` in `frame` on its own, fitted into w×h — the layer panel's thumbnails.
    * Blend mode and opacity are ignored so a layer's own pixels are shown, and transparent areas
    * come back with alpha 0. Returns straight-alpha RGBA rows (top to bottom) per layer, or null
@@ -311,6 +421,7 @@ export class Compositor {
     const meta = this.meta;
     const result: (Uint8ClampedArray<ArrayBuffer> | null)[] = layers.map(() => null);
     if (!meta || frame.isClosed || !layers.length || this.lost) return result;
+    for (const li of layers) if (meta.layers[li].kind === 'video' && isActive(meta.layers[li], frame.frameIndex)) this.uploadLayer(frame, li);
     const perPass = Math.max(1, Math.floor((gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) / h));
     gl.useProgram(this.prog);
     gl.uniform2f(this.u.uCanvas, w, h);
@@ -396,6 +507,7 @@ export class Compositor {
     this.loadToken++;
     for (const t of this.video.values()) {
       if (t.color) gl.deleteTexture(t.color.tex);
+      for (const p of t.planes) if (p) gl.deleteTexture(p.tex);
       if (t.alpha) gl.deleteTexture(t.alpha.tex);
     }
     for (const t of this.stills.values()) gl.deleteTexture(t);
@@ -447,10 +559,26 @@ function upload(gl: WebGL2RenderingContext, cur: SizedTexture | null, frame: Vid
 }
 
 function uploadLuma(gl: WebGL2RenderingContext, cur: SizedTexture | null, luma: LumaPlane): SizedTexture {
-  const t = sized(gl, cur, luma.width, luma.height, gl.R8);
+  return uploadPlane(gl, cur, luma.data, luma, luma.width, luma.height, 1);
+}
+
+/** Chroma subsampling (log2, x and y) of the copied color formats. */
+const CHROMA_SHIFT: Record<ColorFormat, [number, number]> = { I420: [1, 1], I422: [1, 0], I444: [0, 0], NV12: [1, 1] };
+
+/** Upload one 8-bit plane (1 or 2 interleaved components) of a copied frame, rows at `at.stride` bytes. */
+function uploadPlane(
+  gl: WebGL2RenderingContext,
+  cur: SizedTexture | null,
+  data: Uint8Array,
+  at: { offset: number; stride: number },
+  width: number,
+  height: number,
+  components: 1 | 2,
+): SizedTexture {
+  const t = sized(gl, cur, width, height, components === 1 ? gl.R8 : gl.RG8);
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-  gl.pixelStorei(gl.UNPACK_ROW_LENGTH, luma.stride);
-  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, luma.width, luma.height, gl.RED, gl.UNSIGNED_BYTE, luma.data, luma.offset);
+  gl.pixelStorei(gl.UNPACK_ROW_LENGTH, at.stride / components);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, components === 1 ? gl.RED : gl.RG, gl.UNSIGNED_BYTE, data, at.offset);
   gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0); // it would apply to VideoFrame uploads too
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
   return t;
@@ -493,6 +621,7 @@ function link(gl: WebGL2RenderingContext, vs: string, fs: string): WebGLProgram 
   const p = gl.createProgram()!;
   gl.attachShader(p, sh(gl.VERTEX_SHADER, vs));
   gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+  gl.bindAttribLocation(p, 0, 'aPos');
   gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(`program: ${gl.getProgramInfoLog(p)}`);
   return p;
